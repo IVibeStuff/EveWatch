@@ -571,6 +571,32 @@ def best_remap(entries, trained, trained_sp, implant_bonus=0):
 # Character data assembly
 # ----------------------------------------------------------------------------
 
+IMPLANT_SLOT_ATTR = 331                      # implantness
+IMPLANT_BONUS_ATTRS = {175: "charisma", 176: "intelligence", 177: "memory",
+                       178: "perception", 179: "willpower"}
+
+
+def implant_details(type_ids, names):
+    """Slot (1-10) and attribute bonus of each plugged-in implant."""
+    out = []
+
+    def one(tid):
+        try:
+            t, _ = esi_fetch(f"/universe/types/{tid}/")
+        except RuntimeError:
+            return {"type_id": tid, "name": names.get(tid, {}).get("name", str(tid)),
+                    "slot": None, "bonus": {}}
+        dogma = {a["attribute_id"]: a["value"] for a in t.get("dogma_attributes", [])}
+        return {"type_id": tid, "name": t.get("name", str(tid)),
+                "slot": int(dogma[IMPLANT_SLOT_ATTR]) if IMPLANT_SLOT_ATTR in dogma else None,
+                "bonus": {nm: int(dogma[a]) for a, nm in IMPLANT_BONUS_ATTRS.items()
+                          if dogma.get(a)}}
+    if type_ids:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            out = list(pool.map(one, type_ids))
+    return out
+
+
 def char_summary(char_id):
     tok = get_access_token(char_id)
     cid = int(char_id)
@@ -581,10 +607,14 @@ def char_summary(char_id):
     attrs, _ = esi_fetch(f"/characters/{cid}/attributes/", tok)
     implants, _ = esi_fetch(f"/characters/{cid}/implants/", tok)
     names = esi_names(implants) if implants else {}
+    corp_name = esi_names([pub["corporation_id"]]).get(
+        pub.get("corporation_id"), {}).get("name", "") if pub.get("corporation_id") else ""
     return {
         "character_id": cid,
         "name": tokens[str(char_id)]["name"],
         "corporation_id": pub.get("corporation_id"),
+        "corporation": corp_name,
+        "implant_details": implant_details(implants, names),
         "wallet": wallet,
         "total_sp": skills.get("total_sp", 0),
         "unallocated_sp": skills.get("unallocated_sp", 0),
@@ -1430,6 +1460,248 @@ def trade_scan(type_id, mpj=1.2, cargo=5000.0, tax=0.05,
 
 
 # ---------------------------------------------------------------------------
+# Hub scanner: where is the same item cheap in one hub and dear in another?
+# ---------------------------------------------------------------------------
+
+HUBSCAN_PATH = os.path.join(DATA_DIR, "hub_scan.json")
+hubscan = {"state": "idle", "phase": "", "done": 0, "total": 0, "error": "",
+           "cancel": False}
+hubscan_result = load_json(HUBSCAN_PATH, {"rows": [], "finished": None,
+                                          "scope": "", "stations": []})
+_taxonomy = {"cats": None, "groups": {}}
+
+
+def taxonomy_categories():
+    if _taxonomy["cats"] is None:
+        ids, _ = esi_fetch("/universe/categories/")
+
+        def one(cid):
+            try:
+                c, _ = esi_fetch(f"/universe/categories/{cid}/")
+                return {"id": cid, "name": c["name"], "groups": c.get("groups", []),
+                        "published": c.get("published", True)}
+            except RuntimeError:
+                return None
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            cats = [c for c in pool.map(one, ids) if c and c["published"]]
+        _taxonomy["cats"] = {c["id"]: c for c in cats}
+    return [{"id": c["id"], "name": c["name"]}
+            for c in sorted(_taxonomy["cats"].values(), key=lambda c: c["name"])]
+
+
+def _group(gid):
+    if gid not in _taxonomy["groups"]:
+        g, _ = esi_fetch(f"/universe/groups/{gid}/")
+        _taxonomy["groups"][gid] = {"id": gid, "name": g["name"],
+                                    "published": g.get("published", True),
+                                    "types": g.get("types", [])}
+    return _taxonomy["groups"][gid]
+
+
+def taxonomy_groups(cat_id):
+    taxonomy_categories()
+    cat = _taxonomy["cats"].get(cat_id)
+    if not cat:
+        return []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        groups = list(pool.map(lambda g: _try(_group, g), cat["groups"]))
+    return [{"id": g["id"], "name": g["name"]}
+            for g in sorted([g for g in groups if g and g["published"]],
+                            key=lambda g: g["name"])]
+
+
+def _try(fn, *a):
+    try:
+        return fn(*a)
+    except RuntimeError:
+        return None
+
+
+def _scan_pages(path, params, absorb):
+    """Stream every page of an order book without keeping it in memory."""
+    params = dict(params)
+    params["page"] = 1
+    first, headers = esi_fetch(path, params=params, use_cache=False)
+    total = int(next((v for k, v in headers.items() if k.lower() == "x-pages"), 1) or 1)
+    absorb(first)
+    hubscan["done"] += 1
+    for start in range(2, total + 1, 8):
+        if hubscan["cancel"]:
+            return
+        pages = list(range(start, min(total, start + 7) + 1))
+
+        def get(pg):
+            q = dict(params)
+            q["page"] = pg
+            return esi_fetch(path, params=q, use_cache=False)[0]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for rows in pool.map(get, pages):
+                absorb(rows)
+                hubscan["done"] += 1
+        crawl_pause(0.1)
+
+
+def _region_pages(region_id):
+    first, headers = esi_fetch(f"/markets/{region_id}/orders/",
+                               params={"page": 1}, use_cache=False)
+    return int(next((v for k, v in headers.items() if k.lower() == "x-pages"), 1) or 1)
+
+
+def hub_scan_run(station_ids, category_ids, group_ids):
+    st = hubscan
+    st.update(state="running", phase="Preparing", done=0, total=0, error="", cancel=False)
+    try:
+        locs = [l for l in locations if l["station_id"] in set(station_ids)]
+        if len(locs) < 2:
+            raise RuntimeError("Pick at least two market locations to compare.")
+        allowed, scope = None, "Whole market"
+        if category_ids or group_ids:
+            allowed, labels = set(), []
+            taxonomy_categories()
+            if group_ids:
+                for gid in group_ids:
+                    g = _group(gid)
+                    allowed.update(g["types"])
+                    labels.append(g["name"])
+            else:
+                for cid in category_ids:
+                    cat = _taxonomy["cats"][cid]
+                    labels.append(cat["name"])
+                    for gid in cat["groups"]:
+                        g = _try(_group, gid)
+                        if g:
+                            allowed.update(g["types"])
+            scope = ", ".join(labels[:6]) + ("…" if len(labels) > 6 else "")
+        stationset = {l["station_id"] for l in locs}
+        by_region = {}
+        for l in locs:
+            by_region.setdefault(l["region_id"], []).append(l)
+        st["phase"] = "Counting order pages"
+        pages = {rid: _region_pages(rid) for rid in by_region}
+        st.update(total=sum(pages.values()), done=0, phase="Reading order books")
+        books = {}
+
+        def absorb(rows):
+            for o in rows:
+                lid = o["location_id"]
+                if lid not in stationset:
+                    continue
+                tid = o["type_id"]
+                if allowed is not None and tid not in allowed:
+                    continue
+                rec = books.get((lid, tid))
+                if rec is None:
+                    rec = books[(lid, tid)] = ([], [])
+                rec[1 if o["is_buy_order"] else 0].append((o["price"], o["volume_remain"]))
+        for rid in by_region:
+            if st["cancel"]:
+                raise RuntimeError("Cancelled.")
+            _scan_pages(f"/markets/{rid}/orders/", {}, absorb)
+        if st["cancel"]:
+            raise RuntimeError("Cancelled.")
+
+        st["phase"] = "Comparing hubs"
+        quotes = {}
+        for (lid, tid), (sells, buys) in books.items():
+            q = {}
+            if sells:
+                sells.sort()
+                ask = sells[0][0]
+                q["ask"] = ask
+                q["ask_vol"] = sum(v for p, v in sells if p <= ask * 1.02)
+                q["sell_total"] = sum(v for p, v in sells)
+            if buys:
+                buys.sort(reverse=True)
+                bid = buys[0][0]
+                q["bid"] = bid
+                q["bid_vol"] = sum(v for p, v in buys if p >= bid * 0.98)
+            quotes.setdefault(tid, {})[lid] = q
+        books.clear()
+        by_station = {l["station_id"]: l for l in locs}
+        cands = []
+        for tid, per in quotes.items():
+            for a, qa in per.items():
+                if not qa.get("ask") or qa["ask"] <= 0:
+                    continue
+                for b, qb in per.items():
+                    if a == b:
+                        continue
+                    inst = qb.get("bid", 0) >= qa["ask"] * 1.02
+                    pat = qb.get("ask", 0) >= qa["ask"] * 1.08
+                    if not (inst or pat):
+                        continue
+                    vol = min(qa["ask_vol"], qb.get("bid_vol", 0) if inst else qa["ask_vol"])
+                    gain = (qb["bid"] - qa["ask"]) if inst else (qb["ask"] - qa["ask"])
+                    cands.append((gain * vol, tid, a, b))
+        cands.sort(reverse=True)
+        cands = cands[:450]
+
+        st.update(phase="Checking trading activity", done=0, total=len(cands))
+        tids = sorted({c[1] for c in cands})
+        names = esi_names(tids)
+        avg = market_prices()
+        vols = {}
+
+        def type_vol(tid):
+            t = _try(lambda: esi_fetch(f"/universe/types/{tid}/")[0])
+            vols[tid] = (t.get("packaged_volume") or t.get("volume") or 0.01) if t else 0.01
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            list(pool.map(type_vol, tids))
+        hist = {}
+
+        def dest_hist(key):
+            rid, tid = key
+            try:
+                data = get_history(tid, rid)
+            except RuntimeError:
+                data = []
+            last = data[-7:]
+            if last:
+                hist[key] = (sum(d[2] for d in last) / len(last),
+                             sum(d[1] * d[2] for d in last) / max(1, sum(d[2] for d in last)))
+        keys = sorted({(by_station[c[3]]["region_id"], c[1]) for c in cands})
+        st["total"] = len(keys)
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            for _ in pool.map(dest_hist, keys):
+                st["done"] += 1
+                if st["cancel"]:
+                    raise RuntimeError("Cancelled.")
+        save_json(HISTORY_PATH, history_cache)
+        jumps = {}
+        for _, tid, a, b in cands:
+            sa, sb = _loc_system_id(by_station[a]), _loc_system_id(by_station[b])
+            if (sa, sb) not in jumps:
+                try:
+                    jumps[(sa, sb)] = route_jumps(sa, sb)
+                except RuntimeError:
+                    jumps[(sa, sb)] = None
+        rows = []
+        for _, tid, a, b in cands:
+            qa, qb, A, B = quotes[tid][a], quotes[tid][b], by_station[a], by_station[b]
+            hv = hist.get((B["region_id"], tid))
+            j = jumps.get((_loc_system_id(A), _loc_system_id(B)))
+            if j is None:
+                continue
+            rows.append({
+                "tid": tid, "name": names.get(tid, {}).get("name", str(tid)),
+                "from": A["name"], "from_system": A["system"],
+                "to": B["name"], "to_system": B["system"],
+                "ask": qa["ask"], "ask_vol": qa["ask_vol"],
+                "bid": qb.get("bid"), "bid_vol": qb.get("bid_vol", 0),
+                "dst_ask": qb.get("ask"), "dst_sell_vol": qb.get("sell_total", 0),
+                "avg": avg.get(tid), "m3": vols.get(tid, 0.01), "jumps": j,
+                "day_units": round(hv[0], 1) if hv else None,
+                "day_price": round(hv[1], 2) if hv else None})
+        global hubscan_result
+        hubscan_result = {"rows": rows, "finished": time.time(), "scope": scope,
+                          "stations": [l["system"] for l in locs]}
+        save_json(HUBSCAN_PATH, hubscan_result)
+        st["state"] = "done"
+    except Exception as e:  # noqa: BLE001
+        st.update(state="error" if str(e) != "Cancelled." else "idle", error=str(e)[:300])
+
+
+# ---------------------------------------------------------------------------
 # LP store: what is each loyalty point worth?
 # ---------------------------------------------------------------------------
 
@@ -2119,7 +2391,7 @@ class Handler(BaseHTTPRequestHandler):
         p = url.path.rstrip("/") or "/"
         if p.startswith("/api/") and p not in (
                 "/api/market/index", "/api/contracts/index", "/api/status",
-                "/api/heartbeat", "/api/closing"):
+                "/api/heartbeat", "/api/closing", "/api/hubscan/status"):
             last_interactive[0] = time.time()   # let background crawls yield
 
         if p == "/" and method == "GET":
@@ -2387,6 +2659,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
             request_shutdown()
 
+        elif p == "/api/hubscan/taxonomy" and method == "GET":
+            if "category" in q:
+                self._send(200, taxonomy_groups(int(q["category"][0])))
+            else:
+                self._send(200, taxonomy_categories())
+
+        elif p == "/api/hubscan/start" and method == "POST":
+            if hubscan["state"] == "running":
+                self._send(200, {k: v for k, v in hubscan.items()})
+            else:
+                b = self._json_body()
+                threading.Thread(target=hub_scan_run, daemon=True, args=(
+                    [int(x) for x in b.get("stations", [])],
+                    [int(x) for x in b.get("categories", [])],
+                    [int(x) for x in b.get("groups", [])])).start()
+                hubscan.update(state="running", phase="Starting", done=0, total=0, error="")
+                self._send(200, {k: v for k, v in hubscan.items()})
+
+        elif p == "/api/hubscan/cancel" and method == "POST":
+            hubscan["cancel"] = True
+            self._send(200, {"ok": True})
+
+        elif p == "/api/hubscan/status" and method == "GET":
+            self._send(200, {**hubscan, "finished": hubscan_result.get("finished"),
+                             "scope": hubscan_result.get("scope"),
+                             "stations": hubscan_result.get("stations")})
+
+        elif p == "/api/hubscan/result" and method == "GET":
+            self._send(200, hubscan_result)
+
         elif p == "/api/lp/offers" and method == "GET":
             self._send(200, lp_offers(q["corp_id"][0]))
 
@@ -2499,7 +2801,7 @@ main{padding:24px;max-width:1720px;margin:0 auto}
 .card{position:relative;z-index:0}
 .card:focus-within{z-index:30}
 .card.activechar{outline:2px solid var(--acc);outline-offset:-1px}
-.card.collapsed > :not(h2){display:none}
+.card.collapsed > :not(h2){display:none !important}
 .card.collapsed{padding-bottom:12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(370px,1fr));
   gap:16px}
@@ -2630,6 +2932,46 @@ nav button.locked{opacity:.38;cursor:not-allowed}
   display:flex;gap:10px;align-items:baseline;white-space:nowrap}
 .ipanel>.ihead small{font-weight:400;letter-spacing:0;text-transform:none;color:var(--dim);font-size:12px}
 .ipanel>.ibody{padding:10px 14px}
+.ov-grid{display:grid;grid-template-columns:260px minmax(0,1fr);gap:18px;max-width:1500px;margin:0 auto}
+.ov-side{margin:0}
+.ov-portrait{width:100%;max-width:300px;aspect-ratio:1/1;object-fit:cover;border-radius:var(--radius-sm);display:block;background:var(--panel2)}
+.ov-name{font-size:20px;font-weight:700;color:var(--gold);margin-top:12px;letter-spacing:var(--h2-spacing);text-transform:var(--h2-transform)}
+.ov-right{display:grid;gap:18px;align-content:start}
+.ov-two{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:18px}
+.ov-right .ipanel{margin:0}
+.ov-attrs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+.ov-attr{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 8px;text-align:center;position:relative}
+.ov-attr.prim{outline:2px solid var(--acc);outline-offset:-1px}
+.ov-attr svg{width:30px;height:30px;stroke:var(--acc);fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.ov-attr .v{font-size:24px;font-weight:700;line-height:1.1;margin-top:2px}
+.ov-attr .l{font-size:10.5px;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim)}
+.ov-attr .b{font-size:11.5px;color:var(--good)}
+.ov-attr .tag{position:absolute;top:4px;right:6px;font-size:9.5px;color:var(--acc);letter-spacing:1px}
+.ov-slots{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+.ov-slot{aspect-ratio:1/1;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;padding:4px;text-align:center}
+.ov-slot.empty{border-style:dashed;opacity:.65}
+.ov-slot.hw{border-color:color-mix(in srgb,var(--gold) 55%,var(--line))}
+.ov-slot .n{position:absolute;top:3px;left:6px;font-size:10px;color:var(--dim)}
+.ov-slot .plus{font-size:20px;color:var(--dim);opacity:.5}
+.ov-slot img{width:34px;height:34px;border-radius:4px}
+.ov-slot .t{font-size:9.5px;line-height:1.15;margin-top:2px;word-break:break-word;max-height:3.5em;overflow:hidden}
+.sl-lab{font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim);margin:2px 0 6px}
+@media(max-width:800px){.ov-grid,.ov-two{grid-template-columns:minmax(0,1fr)}}
+.ov-two{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}
+@media(max-width:1000px){.ov-two{grid-template-columns:minmax(0,1fr)}}
+.subtabs{display:flex;gap:6px;margin:0 0 18px;border-bottom:1px solid var(--line)}
+.subtabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:8px 16px;cursor:pointer;font-size:14px}
+.subtabs button.active{color:var(--txt);border-bottom-color:var(--acc);font-weight:600}
+.subtabs button:hover{color:var(--txt)}
+.qbar{display:flex;height:18px;border:1px solid var(--line);border-radius:var(--radius-sm);overflow:hidden;background:var(--panel2)}
+.qseg{background:color-mix(in srgb,var(--acc) 70%,transparent);border-right:1px solid var(--panel)}
+.qseg.alt{background:color-mix(in srgb,var(--gold) 60%,transparent)}
+.qticks{position:relative;height:16px;font-size:10.5px;color:var(--dim);margin-top:2px}
+.qticks span{position:absolute;transform:translateX(-2px)}
+.pips{display:inline-flex;gap:2px;vertical-align:middle}
+.pips i{width:10px;height:10px;border:1px solid var(--line);background:var(--panel2);border-radius:2px;display:block}
+.pips i.on{background:var(--acc);border-color:var(--acc)}
 .hchar{display:flex;align-items:center;gap:8px}
 .hchar img{width:30px;height:30px;border-radius:var(--radius-sm);outline:1px solid var(--acc)}
 .themerow{display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap}
@@ -2689,7 +3031,7 @@ const state = {status:null, chars:{}, cards:{}, screen:"app", popFor:null, catal
                plan:[], plans:{}, planChar:null, openGroups:{},
                locations:null};
 
-const TABS = [["characters","Characters"],["overview","Overview"],["planner","Skill Planner"],
+const TABS = [["characters","Characters"],["overview","Overview"],["skills","Skills"],
               ["assets","Assets"],["wallet","Wallet"],["lpstore","LP Store"],["market","Market"],
               ["itemsearch","Item Search"],["contracts","Contracts"],
               ["industry","Industry"]];
@@ -3003,7 +3345,7 @@ async function loadCatalog(){
   try{
     const d = await api("/api/catalog");
     if(d.skills){ state.catalog=d;
-      if(["planner","characters","overview"].includes(state.tab)) softRender(); }
+      if(["skills","characters","overview"].includes(state.tab)) softRender(); }
     else if(d.state!=="error"){ setTimeout(loadCatalog, 2500); }
     else toast("Skill catalog failed: "+d.error);
   }catch(e){ setTimeout(loadCatalog, 4000); }
@@ -3013,14 +3355,15 @@ async function refreshChars(){
     api("/api/character/"+c.character_id+"/summary")
       .then(d=>{ state.chars[c.character_id]=d;
                  if(["characters","overview"].includes(state.tab)) softRender();
-                 else if(state.tab==="planner") renderSkillPick(); })
+                 else if(state.tab==="skills"&&state.skillsSub==="planner") renderSkillPick();
+                 else if(state.tab==="skills") softRender(); })
       .catch(e=>toast(c.name+": "+e.message));
   }
 }
 
 function render(){
   const m=$("#main");
-  ({characters:rSelect, overview:rChars, planner:rPlanner, assets:rAssets,
+  ({characters:rSelect, overview:rChars, skills:rSkills, assets:rAssets,
     wallet:rWallet, lpstore:rLPStore, market:rMarket, itemsearch:rItemSearch, contracts:rContracts,
     industry:rIndustry, setup:rSetupTab}[state.tab])(m);
   applyCollapsed();
@@ -3112,85 +3455,99 @@ async function saveCid(){
 }
 
 /* ---------------- Characters ---------------- */
+const ATTR_LIST=[["intelligence","Intelligence"],["memory","Memory"],["perception","Perception"],
+  ["willpower","Willpower"],["charisma","Charisma"]];
+const ATTR_ICON={
+ perception:'<svg viewBox="0 0 32 32"><path d="M2 16c4-7 9-10 14-10s10 3 14 10c-4 7-9 10-14 10S6 23 2 16z"/><circle cx="16" cy="16" r="4.5"/></svg>',
+ willpower:'<svg viewBox="0 0 32 32"><path d="M16 3c1 5 8 8 8 15a8 8 0 0 1-16 0c0-4 2-5 3-8 2 1 3 2 3 4 2-3 2-7 2-11z"/></svg>',
+ intelligence:'<svg viewBox="0 0 32 32"><path d="M11 24h10M12 28h8"/><path d="M16 3a8 8 0 0 0-4.500 14.600c.9.7 1.500 1.700 1.500 2.900V22h6v-1.500c0-1.200.6-2.200 1.500-2.900A8 8 0 0 0 16 3z"/></svg>',
+ memory:'<svg viewBox="0 0 32 32"><ellipse cx="16" cy="7" rx="10" ry="4"/><path d="M6 7v9c0 2.200 4.500 4 10 4s10-1.800 10-4V7"/><path d="M6 16v9c0 2.200 4.500 4 10 4s10-1.800 10-4v-9"/></svg>',
+ charisma:'<svg viewBox="0 0 32 32"><path d="M4 7h24v15H14l-6 5v-5H4z"/><path d="M10 13h12M10 17h7"/></svg>'};
+function ovAttrs(d){
+  // ESI reports the attributes without implants; the bonus comes from the plugged-in implants
+  const imp={}; (d.implant_details||[]).forEach(i=>Object.entries(i.bonus||{}).forEach(
+    ([k,v])=>{ imp[k]=(imp[k]||0)+v; }));
+  const out={}; ATTR_LIST.forEach(([k])=>{ const b=(d.attributes||{})[k]||0;
+    out[k]={base:b,imp:imp[k]||0,total:b+(imp[k]||0)}; });
+  return out;
+}
+function ovSlot(d,n){
+  const it=(d.implant_details||[]).find(i=>i.slot===n), hw=n>5;
+  if(!it) return `<div class="ov-slot empty ${hw?"hw":""}"><span class="n">${n}</span><span class="plus">+</span></div>`;
+  const bonus=Object.entries(it.bonus||{}).map(([k,v])=>`+${v} ${k}`).join(", ");
+  return `<div class="ov-slot ${hw?"hw":""}" title="${esc(it.name)}${bonus?" — "+bonus:""}">
+    <span class="n">${n}</span><img src="https://images.evetech.net/types/${it.type_id}/icon?size=64" alt="">
+    <div class="t">${esc(it.name)}</div></div>`;
+}
 function rChars(m){
-  const cs=state.status.characters;
-  if(!cs.length){
-    m.innerHTML=`<div class="card"><h2>No characters yet</h2>
-    <p>Add one from the <b>Characters</b> tab.
-    
-    </p></div>`;
-    return;
-  }
-  m.innerHTML = `<div class="grid">`+cs.map(c=>{
-    const d=state.chars[c.character_id];
-    if(!d) return `<div class="card"><div class="charhead">
-      <img class="portrait" src="https://images.evetech.net/characters/${c.character_id}/portrait?size=64">
-      <div><b>${esc(c.name)}</b><br><span class="dim">loading…</span></div>
-      </div></div>`;
-    const q=d.queue||[];
-    const active=q.find(s=>s.finish_date && new Date(s.finish_date)>Date.now());
-    const lastFinish=q.length?q[q.length-1].finish_date:null;
-    const queueLeft=lastFinish?until(lastFinish):null;
-    let queueHtml;
-    if(!q.length||!lastFinish){
-      queueHtml=`<p class="bad">⚠ Skill queue is empty!</p>`;
-    }else{
-      const warn=(new Date(lastFinish)-Date.now())<86400000;
-      let progressHtml="";
-      if(active&&active.start_date){
-        const t0=new Date(active.start_date),t1=new Date(active.finish_date);
-        const pct=Math.max(0,Math.min(100,(Date.now()-t0)/(t1-t0)*100));
-        progressHtml=`<div style="margin:4px 0 8px">
-          <div class="row" style="justify-content:space-between;
-            font-size:12.5px;margin-bottom:3px">
-            <span>▶ <b>${esc(skillName(active.skill_id))}
-              ${roman(active.finished_level)}</b></span>
-            <span class="dim">${pct.toFixed(1)}% ·
-              ${until(active.finish_date)} left</span>
-          </div>
-          <div class="bar"><i style="width:${pct}%"></i></div>
-        </div>`;
-      }
-      queueHtml=progressHtml+
-      (warn?`<p class="warn">⚠ Queue ends in ${queueLeft}</p>`:"")+
-      `<table><tr><th>Skill</th><th class="num">Finishes</th></tr>`+
-      q.slice(0,7).map(s=>{
-        const nm=skillName(s.skill_id);
-        const cur=active&&s.queue_position===active.queue_position;
-        return `<tr><td>${cur?"▶ ":""}${esc(nm)} ${roman(s.finished_level)}</td>
-        <td class="num">${s.finish_date?until(s.finish_date):"paused"}</td></tr>`;
-      }).join("")+
-      (q.length>7?`<tr><td colspan="2" class="dim">…and ${q.length-7} more
-        (total ${queueLeft})</td></tr>`:"")+`</table>`;
+  const cs=state.status.characters, cid=state.activeChar;
+  const c=cs.find(x=>String(x.character_id)===String(cid));
+  if(!c){ m.innerHTML=`<div class="card"><h2>No character selected</h2>
+    <p>Pick one on the <b>Characters</b> tab.</p></div>`; return; }
+  const d=state.chars[cid];
+  if(!d){ m.innerHTML=`<div class="card"><h2>${esc(c.name)}</h2><p class="dim">Loading…</p></div>`; return; }
+  const q=d.queue||[];
+  const active=q.find(s=>s.finish_date && new Date(s.finish_date)>Date.now());
+  const lastFinish=q.length?q[q.length-1].finish_date:null;
+  const at=ovAttrs(d);
+  const sk=active&&state.catalog&&state.catalog.skills[active.skill_id];
+  const pri=sk&&sk.primary, sec=sk&&sk.secondary;
+  const spm=sk&&at[pri]&&at[sec]?(at[pri].total+at[sec].total/2):null;
+  const tiles=ATTR_LIST.map(([k,l])=>`<div class="ov-attr ${k===pri?"prim":""}">
+    ${k===pri?'<span class="tag">PRIMARY</span>':k===sec?'<span class="tag">SECONDARY</span>':""}
+    ${ATTR_ICON[k]}<div class="v">${at[k].total}</div><div class="l">${l}</div>
+    <div class="b">${at[k].imp?"+"+at[k].imp+" implant":"&nbsp;"}</div></div>`).join("");
+  let queueHtml;
+  if(!q.length||!lastFinish) queueHtml=`<p class="bad">⚠ Skill queue is empty!</p>`;
+  else{
+    const warn=(new Date(lastFinish)-Date.now())<86400000;
+    let prog="";
+    if(active&&active.start_date){
+      const t0=new Date(active.start_date),t1=new Date(active.finish_date);
+      const pct=Math.max(0,Math.min(100,(Date.now()-t0)/(t1-t0)*100));
+      prog=`<div style="margin:0 0 10px"><div class="row" style="justify-content:space-between;margin-bottom:3px">
+        <span>▶ <b>${esc(skillName(active.skill_id))} ${roman(active.finished_level)}</b></span>
+        <span class="dim">${pct.toFixed(1)}% · ${until(active.finish_date)} left</span></div>
+        <div class="bar"><i style="width:${pct}%"></i></div></div>`;
     }
-    const at=d.attributes||{};
-    const th=themeOf(d.character_id), isAct=String(d.character_id)===String(state.activeChar);
-    return `<div class="card ${isAct?"activechar":""}">
-      <div class="charhead">
-        <img class="portrait" style="cursor:pointer" title="Make active"
-          onclick="setActive(${d.character_id},true)"
-          src="https://images.evetech.net/characters/${d.character_id}/portrait?size=64">
-        <div style="flex:1"><b style="font-size:15px">${esc(d.name)}</b>
-          ${isAct?`<span class="pill" style="margin-left:6px">active</span>`:""}<br>
-          <span class="dim">${num(d.total_sp)} SP
-          ${d.unallocated_sp?`(+${num(d.unallocated_sp)} unallocated)`:""}</span>
-        </div>
-        <button class="btn sec" title="Remove"
-          onclick="removeChar(${d.character_id})">✕</button>
-      </div>
-      <div class="kv">
+    queueHtml=prog+(warn?`<p class="warn">⚠ Queue ends in ${until(lastFinish)}</p>`:"")+
+      `<table><tr><th>Skill</th><th class="num">Finishes</th></tr>`+
+      q.slice(0,9).map(s=>{ const cur=active&&s.queue_position===active.queue_position;
+        return `<tr><td>${cur?"▶ ":""}${esc(skillName(s.skill_id))} ${roman(s.finished_level)}</td>
+        <td class="num">${s.finish_date?until(s.finish_date):"paused"}</td></tr>`; }).join("")+
+      (q.length>9?`<tr><td colspan="2" class="dim">…and ${q.length-9} more (total ${until(lastFinish)})</td></tr>`:"")+`</table>`;
+  }
+  let nowHtml;
+  if(!q.length||!lastFinish) nowHtml=`<p class="bad">⚠ Skill queue is empty!</p>`;
+  else if(active&&active.start_date){
+    const t0=new Date(active.start_date),t1=new Date(active.finish_date);
+    const pct=Math.max(0,Math.min(100,(Date.now()-t0)/(t1-t0)*100));
+    nowHtml=`<div class="row" style="justify-content:space-between;margin-bottom:3px">
+      <span>▶ <b>${esc(skillName(active.skill_id))} ${roman(active.finished_level)}</b></span>
+      <span class="dim">${pct.toFixed(1)}% · ${until(active.finish_date)} left</span></div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <p class="dim" style="margin-top:8px">${q.length} skill${q.length===1?"":"s"} queued · queue ends in ${until(lastFinish)}</p>
+      ${(new Date(lastFinish)-Date.now())<86400000?`<p class="warn">⚠ Queue ends in ${until(lastFinish)}</p>`:""}`;
+  } else nowHtml=`<p class="dim">Nothing is training right now.</p>`;
+  const nImp=(d.implant_details||[]).filter(i=>i.slot).length;
+  m.innerHTML=`<div class="ov-grid">
+    <div class="card ov-side"><img class="ov-portrait" src="https://images.evetech.net/characters/${d.character_id}/portrait?size=256" alt="">
+      <div class="ov-name">${esc(d.name)}</div><div class="dim">${esc(d.corporation||"")}</div>
+      <div class="kv" style="margin-top:12px"><b>Skill points</b><span>${num(d.total_sp)}</span>
+        ${d.unallocated_sp?`<b>Unallocated</b><span class="gold">${num(d.unallocated_sp)}</span>`:""}
         <b>Wallet</b><span>${isk(d.wallet)}</span>
-        <b>Attributes</b><span class="dim">
-          I ${at.intelligence} · M ${at.memory} · P ${at.perception}
-          · W ${at.willpower} · C ${at.charisma}</span>
-        <b>Implants</b><span class="dim">${d.implants.length?
-          d.implants.map(esc).join("<br>"):"none"}</span>
-      </div>
-      <h3>Skill queue</h3>${queueHtml}
-    </div>`;
-  }).join("")+`</div>
-  <p class="muted-note">Queue times refresh when you reload the page.
-  ESI caches the skill queue for a few minutes.</p>`;
+        <b>Training speed</b><span>${spm?spm.toFixed(1)+" SP/min":"—"}</span></div></div>
+    <div class="ov-right">
+      <div class="ipanel"><div class="ihead">Attributes<small>base + implants · training attributes outlined</small></div>
+        <div class="ibody"><div class="ov-attrs">${tiles}</div></div></div>
+      <div class="ov-two">
+        <div class="ipanel"><div class="ihead">Implants<small>${nImp} of 10 slots</small></div><div class="ibody">
+          <div class="sl-lab">Attribute implants (slots 1–5)</div><div class="ov-slots">${[1,2,3,4,5].map(n=>ovSlot(d,n)).join("")}</div>
+          <div class="sl-lab" style="margin-top:12px">Hardwirings (slots 6–10)</div><div class="ov-slots">${[6,7,8,9,10].map(n=>ovSlot(d,n)).join("")}</div></div></div>
+        <div class="ipanel"><div class="ihead">Now training</div><div class="ibody">${nowHtml}
+          <p style="margin-top:10px"><button class="btn sec" onclick="state.skillsSub='queue';go('skills')">Open full skill queue →</button></p></div></div>
+      </div></div></div>
+    <p class="muted-note">Queue times refresh when you reload the page. ESI caches the skill queue for a few minutes.</p>`;
 }
 function skillName(id){
   return state.catalog?.skills?.[id]?.name || ("Skill "+id);
@@ -3210,13 +3567,135 @@ async function removeChar(id){
 }
 
 /* ---------------- Planner ---------------- */
+function openPlanner(){ state.skillsSub="planner"; go("skills"); }
+function skillsSubGo(k){ state.skillsSub=k; render(); }
+function rSkills(m){
+  const sub=state.skillsSub||"queue";
+  const tabs=[["queue","Queue"],["skills","My skills"],["planner","Planner"]];
+  m.innerHTML=`<div class="subtabs">${tabs.map(([k,l])=>
+    `<button class="${sub===k?"active":""}" onclick="skillsSubGo('${k}')">${l}</button>`).join("")}</div>
+    <div id="skillsBody"></div>`;
+  const body=$("#skillsBody");
+  ({queue:rQueue,skills:rMySkills,planner:rPlanner}[sub])(body);
+}
+function actChar(){
+  const cid=state.activeChar;
+  return {cid, c:(state.status.characters||[]).find(x=>String(x.character_id)===String(cid)), d:state.chars[cid]};
+}
+function rQueue(m){
+  const {c,d}=actChar();
+  if(!c){ m.innerHTML=`<div class="card"><h2>Skill queue</h2><p class="dim">Select a character first.</p></div>`; return; }
+  if(!d){ m.innerHTML=`<div class="card"><h2>Skill queue — ${esc(c.name)}</h2><p class="dim">Loading…</p></div>`; return; }
+  const q=(d.queue||[]).filter(x=>x.finish_date||x.start_date);
+  const now=Date.now();
+  const last=q.length?q[q.length-1].finish_date:null;
+  if(!q.length||!last){
+    m.innerHTML=`<div class="card"><h2>Skill queue — ${esc(c.name)}</h2>
+      <p class="bad">⚠ The skill queue is empty — nothing is training.</p>
+      <p class="muted-note">EveWatch can only read your queue; add skills to it in-game.</p></div>`;
+    return;
+  }
+  const t0=Math.max(now,new Date(q[0].start_date||now).getTime()), tEnd=new Date(last).getTime();
+  const span=Math.max(1,tEnd-t0);
+  const remainSp=q.reduce((a,x)=>{ const end=x.level_end_sp||0, st=Math.max(x.training_start_sp||0,x.level_start_sp||0);
+    return a+Math.max(0,end-st); },0);
+  const warn=(tEnd-now)<86400000;
+  const segs=q.map((x,i)=>{
+    const a=Math.max(t0,new Date(x.start_date||t0).getTime()), b=new Date(x.finish_date||tEnd).getTime();
+    const w=Math.max(0.5,(b-a)/span*100);
+    return `<div class="qseg ${i%2?"alt":""}" style="width:${w}%" title="${esc(skillName(x.skill_id))} ${roman(x.finished_level)} — ${dur((b-a)/60000)}"></div>`;
+  }).join("");
+  const days=Math.ceil(span/86400000), ticks=Array.from({length:Math.min(days,12)},(_,i)=>{
+    const step=days/Math.min(days,12); const d0=Math.round(step*i);
+    return `<span style="left:${d0*86400000/span*100}%">${d0?d0+"d":"now"}</span>`; }).join("");
+  const fmt=iso=>iso?new Date(iso).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—";
+  const planLeft=(state.plan||[]).filter(e=>{ const s=state.catalog&&state.catalog.skills[e[0]];
+    return s&&((d.skills[e[0]]||{}).level||0)<e[1]; }).slice(0,6);
+  m.innerHTML=`<div class="card"><h2>Skill queue — ${esc(c.name)}</h2>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill">${q.length} skill${q.length===1?"":"s"} queued</span>
+      <span class="pill">Queue time left: <b>${until(last)}</b></span>
+      <span class="pill">Ends: <b>${fmt(last)}</b></span>
+      <span class="pill">SP in queue: <b>${num(remainSp)}</b></span></div>
+    ${warn?`<div class="alertbox down">⚠ The queue runs out in ${until(last)} — queue more skills in-game soon.</div>`:""}
+    <div class="qbar">${segs}</div><div class="qticks">${ticks}</div>
+    <table style="margin-top:14px"><tr><th>#</th><th>Skill</th><th class="num">SP</th><th>Starts</th><th>Finishes</th><th class="num">Duration</th></tr>
+    ${q.map((x,i)=>{
+      const act=i===0&&x.finish_date&&new Date(x.start_date)<=now;
+      const a=new Date(x.start_date||0).getTime(), b=new Date(x.finish_date||0).getTime();
+      const sp=Math.max(0,(x.level_end_sp||0)-Math.max(x.training_start_sp||0,x.level_start_sp||0));
+      return `<tr><td>${i+1}</td><td>${act?"▶ ":""}<b>${esc(skillName(x.skill_id))}</b> ${roman(x.finished_level)}</td>
+        <td class="num">${sp?num(sp):"—"}</td><td class="dim">${act?"training now":fmt(x.start_date)}</td>
+        <td>${x.finish_date?fmt(x.finish_date):"paused"}</td>
+        <td class="num">${x.finish_date&&x.start_date?dur(Math.max(0,b-Math.max(a,act?now:a))/60000):"—"}</td></tr>`;
+    }).join("")}</table>
+    <p class="muted-note">EveWatch can only read your queue — add or reorder skills in-game. Times refresh when you reload the page (ESI caches the queue for a few minutes).</p></div>
+    ${planLeft.length?`<div class="card"><h2>Next from your plan</h2>
+      <p class="dim">Plan items you haven't finished yet — queue these next:</p>
+      ${planLeft.map(e=>`<div>• ${esc(state.catalog.skills[e[0]].name)} <b>${roman(e[1])}</b>
+        <span class="dim">(you have ${(d.skills[e[0]]||{}).level?roman(d.skills[e[0]].level):"none"})</span></div>`).join("")}
+      <p><button class="btn sec" onclick="skillsSubGo('planner')">Open planner</button></p></div>`:""}`;
+}
+function prereqsMet(d,s){ return (s.prereqs||[]).every(([pid,pl])=>((d.skills[pid]||{}).level||0)>=pl); }
+function rMySkills(m){
+  const {c,d}=actChar();
+  if(!c){ m.innerHTML=`<div class="card"><h2>My skills</h2><p class="dim">Select a character first.</p></div>`; return; }
+  if(!d||!state.catalog){ m.innerHTML=`<div class="card"><h2>My skills</h2><p class="dim">Loading${state.catalog?"":" skill catalog (one-time)"}…</p></div>`; 
+    if(state.tab==="skills") setTimeout(()=>{ if(state.tab==="skills"&&state.skillsSub==="skills") softRender(); },2000); return; }
+  const f=state.msFilter||"trained", q=(state.msQ||"").toLowerCase();
+  const all=Object.values(state.catalog.skills);
+  const lvl=s=>(d.skills[s.id]||{}).level||0, sp=s=>(d.skills[s.id]||{}).sp||0;
+  const trainingId=((d.queue||[]).find(x=>x.finish_date&&new Date(x.finish_date)>Date.now())||{}).skill_id;
+  const shown=all.filter(s=>(f==="all"||(f==="trained"?lvl(s)>0:f==="ready"?(lvl(s)===0&&prereqsMet(d,s)):lvl(s)===0))
+    &&(!q||s.name.toLowerCase().includes(q)));
+  const totalSp=Object.values(d.skills).reduce((a,x)=>a+x.sp,0);
+  const nTrained=all.filter(s=>lvl(s)>0).length, nV=all.filter(s=>lvl(s)===5).length;
+  const groups=Object.entries(state.catalog.groups).sort((a,b)=>a[1].localeCompare(b[1]));
+  const pips=l=>Array.from({length:5},(_,i)=>`<i class="${i<l?"on":""}"></i>`).join("");
+  m.innerHTML=`<div class="card"><h2>My skills — ${esc(c.name)}</h2>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill">${num(totalSp)} SP</span><span class="pill">${nTrained} skills trained</span>
+      <span class="pill">${nV} at level V</span></div>
+    <div class="row" style="margin-bottom:10px">
+      <input id="msq" placeholder="Search skills…" value="${esc(state.msQ||"")}" oninput="state.msQ=this.value;msRefresh()">
+      <select onchange="state.msFilter=this.value;rMySkills($('#skillsBody'))">
+        ${[["trained","Trained skills"],["ready","Untrained — ready to train"],["untrained","All untrained"],["all","All skills"]].map(
+          ([k,l])=>`<option value="${k}" ${f===k?"selected":""}>${l}</option>`).join("")}</select></div>
+    <div id="msList"></div></div>`;
+  window.msRefresh=()=>{
+    const qq=(state.msQ||"").toLowerCase();
+    $("#msList").innerHTML=groups.map(([gid,gname])=>{
+      const rows=shown.filter(s=>String(s.group)===gid&&(!qq||s.name.toLowerCase().includes(qq)))
+        .sort((a,b)=>a.name.localeCompare(b.name));
+      if(!rows.length) return "";
+      const open=qq?true:state.msOpen&&state.msOpen[gid];
+      const gsp=all.filter(s=>String(s.group)===gid).reduce((a,s)=>a+sp(s),0);
+      return `<div class="grp"><div class="grphead" onclick="state.msOpen=state.msOpen||{};state.msOpen['${gid}']=!state.msOpen['${gid}'];msRefresh()">
+        ${open?"▾":"▸"} ${esc(gname)} <span class="dim" style="font-weight:400">(${rows.length}${gsp?" · "+num(gsp)+" SP":""})</span></div>
+        ${open?`<div class="grpbody"><table><tr><th>Skill</th><th>Level</th><th>Rank</th><th class="num">SP</th><th class="num">Status</th></tr>
+        ${rows.map(s=>{ const l=lvl(s);
+          const st=s.id===trainingId?`<span class="gold">▶ training</span>`:l>=5?`<span class="good">✔ maxed</span>`:
+            l===0&&!prereqsMet(d,s)?`<span class="dim">needs prerequisites</span>`:l===0?`<span class="dim">ready to train</span>`:`<span class="dim">→ V in ${dur(timeToVof(d,s))}</span>`;
+          return `<tr class="${l?"trained":""}"><td title="${esc(s.desc)}">${esc(s.name)}</td>
+            <td><span class="pips">${pips(l)}</span> <span class="dim">${l?roman(l):""}</span></td>
+            <td>${s.rank}</td><td class="num">${sp(s)?num(sp(s)):"—"}</td><td class="num">${st}</td></tr>`; }).join("")}
+        </table></div>`:""}</div>`;
+    }).join("")||`<p class="dim">Nothing matches.</p>`;
+  };
+  msRefresh();
+}
+function timeToVof(d,s){
+  const l=(d.skills[s.id]||{}).level||0, cur=(d.skills[s.id]||{}).sp??spAt(s.rank,l);
+  const a=d.attributes||{}, rate=((a[s.primary]||20)+(a[s.secondary]||20)/2);
+  return (spAt(s.rank,5)-cur)/rate;
+}
 function rPlanner(m){
   if(!state.catalog){
     const cs=state.status.catalog||{};
     m.innerHTML=`<div class="card"><h2>Skill Planner</h2>
     <p>Building the skill catalog from ESI (one-time, then cached)…
     ${cs.done||0} / ${cs.total||"?"} skills</p></div>`;
-    setTimeout(()=>{ if(state.tab==="planner") render(); }, 2000);
+    setTimeout(()=>{ if(state.tab==="skills") render(); }, 2000);
     return;
   }
   const chars=state.status.characters;
@@ -3940,6 +4419,21 @@ Amarr VIII (Oris) - Emperor Family Academy
     best price.</p>
     <div id="trOut"></div>
   </div>
+  <div class="card" id="hsCard"><h2>Hub scanner — find hauling opportunities</h2>
+    <p class="muted-note">Finds items that are cheap in one of your hubs and dear in another, with real
+    trading activity at the destination — even if you don't own any. It reads every order in the
+    hubs' regions (a few minutes for the whole market; much faster for selected categories), then
+    ranks the gaps by ISK per hour. Change the filters below at any time without rescanning.</p>
+    <div class="row"><b>Hubs:</b><span id="hsHubs"></span></div>
+    <div class="row" style="margin-top:8px"><b>Scan:</b>
+      <label><input type="radio" name="hsScope" value="all" checked onchange="hsScopeChanged()"> the whole market</label>
+      <label><input type="radio" name="hsScope" value="sel" onchange="hsScopeChanged()"> only selected item groups</label>
+      <button class="btn" id="hsGo" onclick="hsStart()">Scan hubs</button>
+      <button class="btn sec" id="hsStop" style="display:none" onclick="api('/api/hubscan/cancel',{method:'POST'})">Stop</button>
+      <span id="hsStatus" class="dim"></span></div>
+    <div id="hsSel" style="display:none;margin-top:8px"></div>
+    <div id="hsFilters"></div>
+    <div id="hsOut"></div></div>
   <div class="card" id="apCard"><h2>Appraisal</h2>
     <p class="muted-note">Copy items from any in-game inventory
     (Ctrl+A, Ctrl+C) and paste them here. Formats like
@@ -3964,6 +4458,7 @@ Amarr VIII (Oris) - Emperor Family Academy
     }
   });
   fillShipPresets();
+  hsInit();
   pollIndex();
   if(state._movers) renderMovers();
   attachSuggest("mq",marketLookup);
@@ -4980,7 +5475,7 @@ function planMastery(cid,shipId,toTier){     // add everything missing up to tie
     });
   }
   toast("Added to your skill plan — open the Skill Planner to see the training time.");
-  go("planner");
+  openPlanner();
 }
 async function ensureBonuses(){
   if(state.bon||state._bonLoading) return;
@@ -5175,7 +5670,7 @@ function addReqToPlan(cid){
   });
   const b=$("#addBtn_"+cid);
   if(b){ b.outerHTML=`<span class="good">✔ Added to your plan —</span>
-    <button class="btn sec" onclick="go('planner')">Open skill planner</button>`; }
+    <button class="btn sec" onclick="openPlanner()">Open skill planner</button>`; }
 }
 
 function sparkSvg(vals,d1){
@@ -5404,6 +5899,167 @@ async function resolveType(q){
   const hits=await api("/api/market/search?q="+encodeURIComponent(q));
   return hits.length?hits[0]:null;
 }
+
+/* ---- hub scanner ---- */
+const HS={cats:null,groups:{},selCats:new Set(),selGroups:new Set(),sort:"iskph",dir:-1,result:null,
+          hubs:null,poll:null,opened:false};
+function hsPrefs(){ try{ return JSON.parse(localStorage.getItem("evw_hs")||"{}"); }catch(e){ return {}; } }
+function hsSavePrefs(){
+  const g=id=>document.getElementById(id);
+  try{ localStorage.setItem("evw_hs",JSON.stringify({ship:g("hsShip")?.value,mpj:g("hsMpj")?.value,
+    cargo:g("hsCargo")?.value,tax:g("hsTax")?.value,broker:g("hsBroker")?.value,minm:g("hsMinM")?.value,
+    minp:g("hsMinP")?.value,minu:g("hsMinU")?.value,mini:g("hsMinI")?.value,maxj:g("hsMaxJ")?.value,
+    mode:g("hsMode")?.value,hubs:HS.hubs?[...HS.hubs]:null})); }catch(e){}
+}
+async function hsInit(){
+  await loadLocations().catch(()=>{});
+  const pr=hsPrefs(), locs=state.locations||[];
+  HS.hubs=new Set(pr.hubs&&pr.hubs.length?pr.hubs:locs.map(l=>l.station_id));
+  hsRenderHubs(); hsRenderFilters(pr);
+  try{
+    const st=await api("/api/hubscan/status");
+    if(st.state==="running") hsPoll();
+    else{ HS.result=await api("/api/hubscan/result"); hsRender(); }
+  }catch(e){}
+}
+function hsRenderHubs(){
+  const el=$("#hsHubs"); if(!el) return;
+  const locs=state.locations||[];
+  el.innerHTML=locs.map(l=>`<label style="margin-right:10px"><input type="checkbox" ${HS.hubs.has(l.station_id)?"checked":""}
+    onchange="hsToggleHub(${l.station_id},this.checked)"> ${esc(l.system)}</label>`).join("")||`<span class="dim">Add market locations above first.</span>`;
+}
+function hsToggleHub(id,on){ on?HS.hubs.add(id):HS.hubs.delete(id); hsSavePrefs(); }
+function hsDefaultsFromSkills(){
+  const cid=state.activeChar; if(!cid||!state.chars[cid]) return null;
+  const acc=charLevel(cid,16622), br=charLevel(cid,3446);
+  return {tax:Math.round(7.5*(1-0.11*acc)*100)/100, broker:Math.round((3-0.3*br)*100)/100, acc, br};
+}
+function hsRenderFilters(pr){
+  const el=$("#hsFilters"); if(!el) return;
+  const d=hsDefaultsFromSkills()||{tax:7.5,broker:3,acc:0,br:0};
+  el.innerHTML=`<div class="row" style="margin-top:12px">
+      <select id="hsShip" onchange="hsApplyShip()">${SHIP_PRESETS.map((p,i)=>
+        `<option value="${i}" ${(pr.ship!=null?+pr.ship:3)===i?"selected":""}>${p[0]}</option>`).join("")}</select>
+      <span class="dim">min/jump</span><input id="hsMpj" size="4" value="${pr.mpj||1.5}" oninput="hsChanged()">
+      <span class="dim">cargo m³</span><input id="hsCargo" size="8" value="${pr.cargo||5500}" oninput="hsChanged()">
+      <span class="dim">sales tax %</span><input id="hsTax" size="4" value="${pr.tax||d.tax}" oninput="hsChanged()">
+      <span class="dim">broker fee %</span><input id="hsBroker" size="4" value="${pr.broker||d.broker}" oninput="hsChanged()">
+      <span class="dim" title="Estimated from the active character's Accounting and Broker Relations skills; standings aren't included. Edit to match your in-game numbers.">ⓘ</span></div>
+    <div class="row" style="margin-top:6px">
+      <span class="dim">Sell by</span>
+      <select id="hsMode" onchange="hsChanged()"><option value="instant" ${pr.mode!=="patient"?"selected":""}>selling into buy orders (instant)</option>
+        <option value="patient" ${pr.mode==="patient"?"selected":""}>listing a sell order (patient)</option></select>
+      <span class="dim">min margin %</span><input id="hsMinM" size="4" value="${pr.minm||5}" oninput="hsChanged()">
+      <span class="dim">min profit/trip</span><input id="hsMinP" size="10" value="${pr.minp||1000000}" oninput="hsChanged()">
+      <span class="dim">min units/day</span><input id="hsMinU" size="5" value="${pr.minu||10}" oninput="hsChanged()">
+      <span class="dim">min ISK/day</span><input id="hsMinI" size="10" value="${pr.mini||50000000}" oninput="hsChanged()">
+      <span class="dim">max jumps</span><input id="hsMaxJ" size="4" value="${pr.maxj||30}" oninput="hsChanged()"></div>`;
+}
+function hsApplyShip(){
+  const p=SHIP_PRESETS[parseInt($("#hsShip").value)];
+  if(p&&p[1]!=null){ $("#hsMpj").value=p[1]; $("#hsCargo").value=p[2]; }
+  hsChanged();
+}
+function hsChanged(){ hsSavePrefs(); hsRender(); }
+async function hsScopeChanged(){
+  const sel=document.querySelector("input[name=hsScope]:checked").value==="sel";
+  const box=$("#hsSel"); box.style.display=sel?"block":"none";
+  if(!sel) return;
+  if(!HS.cats){
+    box.innerHTML=`<span class="dim">Loading item categories…</span>`;
+    try{ HS.cats=await api("/api/hubscan/taxonomy"); }catch(e){ box.innerHTML=`<span class="bad">${esc(e.message)}</span>`; return; }
+  }
+  hsRenderSel();
+}
+function hsRenderSel(){
+  const box=$("#hsSel");
+  const one=HS.selCats.size===1?[...HS.selCats][0]:null;
+  box.innerHTML=`<div class="dim" style="margin-bottom:4px">Item categories (tick one or more):</div>
+    <div style="columns:4 190px;font-size:13px">${HS.cats.map(c=>`<label style="display:block"><input type="checkbox" ${HS.selCats.has(c.id)?"checked":""}
+      onchange="hsToggleCat(${c.id},this.checked)"> ${esc(c.name)}</label>`).join("")}</div>
+    ${one&&HS.groups[one]?`<div class="dim" style="margin:8px 0 4px">Narrow to specific groups (optional — leave all unticked for the whole category):</div>
+    <div style="columns:3 240px;font-size:13px;max-height:260px;overflow:auto">${HS.groups[one].map(g=>
+      `<label style="display:block"><input type="checkbox" ${HS.selGroups.has(g.id)?"checked":""}
+      onchange="hsToggleGroup(${g.id},this.checked)"> ${esc(g.name)}</label>`).join("")}</div>`
+    :one?`<span class="dim">Loading groups…</span>`:""}`;
+}
+async function hsToggleCat(id,on){
+  on?HS.selCats.add(id):HS.selCats.delete(id);
+  HS.selGroups.clear(); hsRenderSel();
+  if(HS.selCats.size===1){
+    const cid=[...HS.selCats][0];
+    if(!HS.groups[cid]){ try{ HS.groups[cid]=await api("/api/hubscan/taxonomy?category="+cid); }catch(e){ HS.groups[cid]=[]; } }
+    hsRenderSel();
+  }
+}
+function hsToggleGroup(id,on){ on?HS.selGroups.add(id):HS.selGroups.delete(id); }
+async function hsStart(){
+  const sel=document.querySelector("input[name=hsScope]:checked").value==="sel";
+  if(HS.hubs.size<2){ toast("Tick at least two hubs to compare."); return; }
+  if(sel&&!HS.selCats.size){ toast("Tick at least one item category, or choose the whole market."); return; }
+  await api("/api/hubscan/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({stations:[...HS.hubs],categories:sel?[...HS.selCats]:[],groups:sel?[...HS.selGroups]:[]})});
+  hsPoll();
+}
+function hsPoll(){
+  clearTimeout(HS.poll);
+  const tick=async()=>{
+    const st=await api("/api/hubscan/status").catch(()=>null);
+    const go=$("#hsGo"), stop=$("#hsStop"), msg=$("#hsStatus");
+    if(!st||!go){ return; }                       // left the tab
+    if(st.state==="running"){
+      go.disabled=true; stop.style.display="inline-block";
+      msg.textContent=`${st.phase}… ${st.total?Math.round(st.done/st.total*100)+"%":""}`;
+      HS.poll=setTimeout(tick,1500); return; }
+    go.disabled=false; stop.style.display="none"; msg.textContent="";
+    if(st.state==="error"){ msg.innerHTML=`<span class="bad">${esc(st.error)}</span>`; return; }
+    HS.result=await api("/api/hubscan/result"); hsRender();
+  };
+  tick();
+}
+function hsSort(k){ if(HS.sort===k) HS.dir=-HS.dir; else{ HS.sort=k; HS.dir=-1; } hsRender(); }
+function hsRender(){
+  const el=$("#hsOut"); if(!el) return;
+  const r=HS.result;
+  if(!r||!r.rows||!r.rows.length){ el.innerHTML=r&&r.finished?`<p class="dim">The last scan found nothing profitable.</p>`:""; return; }
+  const v=id=>parseFloat($("#"+id)?.value)||0;
+  const tax=v("hsTax")/100, broker=v("hsBroker")/100, cargo=v("hsCargo")||1, mpj=v("hsMpj")||1.5;
+  const patient=$("#hsMode")?.value==="patient";
+  const minM=v("hsMinM"), minP=v("hsMinP"), minU=v("hsMinU"), minI=v("hsMinI"), maxJ=v("hsMaxJ")||999;
+  const rows=[];
+  for(const x of r.rows){
+    const sell=patient?x.dst_ask:x.bid; if(!sell) continue;
+    const unit=sell*(1-tax-(patient?broker:0))-x.ask;
+    if(unit<=0) continue;
+    const depth=patient?x.ask_vol:Math.min(x.ask_vol,x.bid_vol);
+    const units=Math.min(depth,Math.floor(cargo/x.m3));
+    if(units<=0) continue;
+    const profit=unit*units, margin=unit/x.ask*100, hours=(x.jumps*mpj+6)/60;
+    const dayUnits=x.day_units||0, dayIsk=(x.day_price||0)*dayUnits;
+    if(margin<minM||profit<minP||dayUnits<minU||dayIsk<minI||x.jumps>maxJ) continue;
+    rows.push({...x,sell,unit,units,profit,margin,hours,iskph:profit/hours,dayUnits,dayIsk,
+      odd:x.avg&&(sell>x.avg*2||x.ask<x.avg*0.4)});
+  }
+  rows.sort((a,b)=>(a[HS.sort]<b[HS.sort]?-1:a[HS.sort]>b[HS.sort]?1:0)*HS.dir||0);
+  const th=(k,l)=>`<th class="sortable num" onclick="hsSort('${k}')">${l}${HS.sort===k?(HS.dir<0?" ▼":" ▲"):""}</th>`;
+  const when=r.finished?new Date(r.finished*1000).toLocaleString():"";
+  el.innerHTML=`<p class="dim" style="margin-top:12px">Last scan: ${esc(r.scope||"")} · ${esc((r.stations||[]).join(", "))} · ${esc(when)}
+    · ${rows.length} route${rows.length===1?"":"s"} pass your filters</p>
+    ${rows.length?`<div style="overflow-x:auto"><table><tr><th>Item</th><th>Route</th>${th("ask","Buy @")}${th("sell","Sell @")}${th("margin","Margin")}
+      ${th("units","Units/trip")}${th("profit","Profit/trip")}${th("jumps","Jumps")}${th("dayUnits","Sells/day")}${th("iskph","ISK/hour")}</tr>`+
+    rows.slice(0,200).map(x=>`<tr><td><a href="#" onclick="hsOpenItem(${x.tid},'${esc(x.name).replace(/'/g,"\\'")}');return false" style="color:var(--acc)">${esc(x.name)}</a>${
+      x.odd?` <span class="warn" title="Price is far from CCP's average — check that it's real">⚠</span>`:""}</td>
+      <td>${esc(x.from_system)} → ${esc(x.to_system)}</td><td class="num">${isk(x.ask)}</td><td class="num">${isk(x.sell)}</td>
+      <td class="num good">${x.margin.toFixed(1)}%</td><td class="num">${num(x.units)}</td>
+      <td class="num">${isk(Math.round(x.profit))}</td><td class="num">${x.jumps}</td><td class="num">${num(Math.round(x.dayUnits))}</td>
+      <td class="num"><b>${isk(Math.round(x.iskph))}</b></td></tr>`).join("")+`</table></div>`
+      :`<p class="dim">Nothing passes the filters — try lowering the minimum margin, profit or daily volume.</p>`}
+    <p class="muted-note">Profit per trip uses order depth within 2% of the best price at each end, capped by cargo space,
+    after ${(tax*100).toFixed(2)}% sales tax${patient?` and ${(broker*100).toFixed(2)}% broker fee`:""}. "Sells/day" is the
+    destination region's average over the last 7 days. ⚠ marks prices far from CCP's average — likely a thin or manipulated
+    market. Prices change quickly: re-check the Market tab before you haul anything expensive.</p>`;
+}
+function hsOpenItem(id,name){ state._isItem={id,name}; state._info=null; go("itemsearch"); }
 
 /* ---- trade routes ---- */
 const SHIP_PRESETS=[

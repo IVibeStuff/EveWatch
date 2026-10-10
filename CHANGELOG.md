@@ -1,6 +1,9 @@
 # Changelog
 
-## 1.4.0
+## 1.5.0
+- Skills tab: Queue (timeline), My skills (by group, level pips) and Planner as sub-tabs; Overview shows the training skill with a link.
+- Market: Hub scanner finds items cheap in one hub and dear in another (whole market or chosen item groups), with activity, tax and cargo filters.
+- Overview tab redesigned as a single-character sheet: portrait, attribute tiles with icons (training attributes outlined), implants in their 10 slots, skill queue.
 - Ship bonuses (role + per-skill-level) shown at the active character's current skills; missing skills for mastery shown as an EVE-style prerequisite tree.
 - Ship mastery (I-V) per character in the Item Search ship panel, with missing skills and one-click plan; data from CCP's static data export (bundled; Help → Refresh ship mastery data updates it).
 - LP Store tab: research-agent points → datacores (100 RP + 10,000 ISK each) priced at all market hubs. Optional research-points permission.
