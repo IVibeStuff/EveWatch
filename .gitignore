@@ -12,3 +12,6 @@ pkg/
 
 # Local scratch
 style_mockups.html
+
+# CCP static data download (large; the app downloads its own copy)
+*.zip

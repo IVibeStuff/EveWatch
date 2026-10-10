@@ -1,6 +1,8 @@
 # Changelog
 
-## 1.3.0
+## 1.4.0
+- Ship bonuses (role + per-skill-level) shown at the active character's current skills; missing skills for mastery shown as an EVE-style prerequisite tree.
+- Ship mastery (I-V) per character in the Item Search ship panel, with missing skills and one-click plan; data from CCP's static data export (bundled; Help → Refresh ship mastery data updates it).
 - LP Store tab: research-agent points → datacores (100 RP + 10,000 ISK each) priced at all market hubs. Optional research-points permission.
 - Setup and loyalty-points settings move to Help → "Setup & loyalty points…" once characters exist (first-launch flow unchanged).
 - Help → "Close on Exit" (default OFF): when ON, EveWatch quits after its last browser tab closes.

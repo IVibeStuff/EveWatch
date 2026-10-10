@@ -8,7 +8,9 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 a = Analysis(
     [os.path.join(ROOT, "evewatch.py")],
     pathex=[ROOT],
-    datas=[(os.path.join(ROOT, "assets", "icon.png"), "assets")],
+    datas=[(os.path.join(ROOT, "assets", "icon.png"), "assets"),
+           (os.path.join(ROOT, "assets", "ship_masteries.json"), "assets"),
+           (os.path.join(ROOT, "assets", "ship_bonuses.json"), "assets")],
     hiddenimports=["evewatch_tray"] + collect_submodules("pystray"),
     excludes=["tkinter", "unittest", "pydoc"],
 )

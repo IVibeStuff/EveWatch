@@ -1538,6 +1538,162 @@ def open_folder(path):
         subprocess.Popen(["xdg-open", path])
 
 
+# ---------------------------------------------------------------------------
+# Ship mastery data (from CCP's Static Data Export - ESI has no mastery API)
+# ---------------------------------------------------------------------------
+
+MASTERY_PATH = os.path.join(DATA_DIR, "ship_masteries.json")
+SDE_URL = ("https://developers.eveonline.com/static-data/"
+           "eve-online-static-data-latest-jsonl.zip")
+mastery_status = {"state": "idle", "error": "", "done": 0, "total": 0}
+_mastery = {"data": None}
+
+
+def build_masteries(mastery_lines, cert_lines, build=None):
+    """Compact form: ships {shipId: [tier1certs..tier5certs]} and certs
+    {certId: {n: name, s: {skillId: [req at I..V]}}}. Tier N needs every
+    certificate of that tier trained to grade N (basic..elite)."""
+    ships = {}
+    for line in mastery_lines:
+        d = json.loads(line)
+        tiers = sorted(d["_value"], key=lambda x: x["_key"])
+        ships[str(d["_key"])] = [t["_value"] for t in tiers]
+    used = {c for tiers in ships.values() for t in tiers for c in t}
+    certs = {}
+    for line in cert_lines:
+        d = json.loads(line)
+        if d["_key"] not in used:
+            continue
+        certs[str(d["_key"])] = {
+            "n": d["name"]["en"],
+            "s": {str(sk["_key"]): [sk.get("basic", 0), sk.get("standard", 0),
+                                     sk.get("improved", 0), sk.get("advanced", 0),
+                                     sk.get("elite", 0)]
+                  for sk in d.get("skillTypes", [])}}
+    return {"build": build, "ships": ships, "certs": certs}
+
+
+BONUS_PATH = os.path.join(DATA_DIR, "ship_bonuses.json")
+_bonus = {"data": None}
+_UNIT_SUFFIX = {105: "%", 108: "%", 109: "%", 111: "%", 124: "%", 127: "%",
+                139: "+", 104: "x", 1: " m"}
+
+
+def _clean_bonus_text(t):
+    t = re.sub(r"<[^>]+>", "", t or "")
+    return t.replace("\u00a0", " ").strip()
+
+
+def build_bonuses(lines):
+    """Ship/type bonuses: {typeId: {r: role bonuses, s: [[skillId, bonuses]],
+    m: misc}} where a bonus is [value, unit suffix, text]. Skill bonuses are
+    'per level' of that skill."""
+    def conv(b):
+        if not b:
+            return None
+        text = _clean_bonus_text((b.get("bonusText") or {}).get("en"))
+        if not text:
+            return None
+        return [b.get("bonus"), _UNIT_SUFFIX.get(b.get("unitID"), ""), text]
+    out = {}
+    for line in lines:
+        d = json.loads(line)
+        rec = {}
+        r = [x for x in map(conv, d.get("roleBonuses", [])) if x]
+        if r:
+            rec["r"] = r
+        sk = []
+        for t in d.get("types", []):
+            bl = [x for x in map(conv, t["_value"]) if x]
+            if bl:
+                sk.append([t["_key"], bl])
+        if sk:
+            rec["s"] = sk
+        m = [x for x in map(conv, d.get("miscBonuses", [])) if x]
+        if m:
+            rec["m"] = m
+        if rec:
+            out[str(d["_key"])] = rec
+    return out
+
+
+def load_bonuses():
+    if _bonus["data"]:
+        return _bonus["data"]
+    best = None
+    for path in (BONUS_PATH, resource_path(os.path.join("assets", "ship_bonuses.json"))):
+        d = load_json(path, None)
+        if d and d.get("types") and (best is None or (d.get("build") or 0) > (best.get("build") or 0)):
+            best = d
+    _bonus["data"] = best or {"build": None, "types": {}}
+    return _bonus["data"]
+
+
+def load_masteries():
+    if _mastery["data"]:
+        return _mastery["data"]
+    best = None
+    for path in (MASTERY_PATH, resource_path(os.path.join("assets", "ship_masteries.json"))):
+        d = load_json(path, None)
+        if d and d.get("ships") and (best is None or (d.get("build") or 0) > (best.get("build") or 0)):
+            best = d
+    _mastery["data"] = best or {"build": None, "ships": {}, "certs": {}}
+    return _mastery["data"]
+
+
+def refresh_masteries():
+    """Download CCP's latest SDE (about 100 MB, once) and rebuild the mastery
+    file from it. Runs in the background; progress in mastery_status."""
+    import tempfile
+    import zipfile
+    if mastery_status["state"] == "running":
+        return
+    mastery_status.update(state="running", error="", done=0, total=0)
+
+    def work():
+        tmp = None
+        try:
+            req = urllib.request.Request(SDE_URL, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                mastery_status["total"] = int(resp.headers.get("Content-Length") or 0)
+                fd, tmp = tempfile.mkstemp(suffix=".zip")
+                with os.fdopen(fd, "wb") as f:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        mastery_status["done"] += len(chunk)
+            with zipfile.ZipFile(tmp) as z:
+                names = set(z.namelist())
+                build = None
+                if "_sde.jsonl" in names:
+                    build = json.loads(z.read("_sde.jsonl").decode().splitlines()[0]
+                                       ).get("buildNumber")
+                data = build_masteries(
+                    z.read("masteries.jsonl").decode("utf-8").splitlines(),
+                    z.read("certificates.jsonl").decode("utf-8").splitlines(), build)
+                bonus = None
+                if "typeBonus.jsonl" in names:
+                    bonus = {"build": build, "types": build_bonuses(
+                        z.read("typeBonus.jsonl").decode("utf-8").splitlines())}
+            if not data["ships"]:
+                raise RuntimeError("The download had no mastery data.")
+            os.makedirs(DATA_DIR, exist_ok=True)
+            save_json(MASTERY_PATH, data)
+            _mastery["data"] = data
+            if bonus and bonus["types"]:
+                save_json(BONUS_PATH, bonus)
+                _bonus["data"] = bonus
+            mastery_status["state"] = "done"
+        except Exception as e:  # noqa: BLE001
+            mastery_status.update(state="error", error=str(e)[:200])
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+    threading.Thread(target=work, daemon=True).start()
+
+
 type_names = load_json(TYPENAMES_PATH, None)   # type_id(str) -> name
 
 
@@ -2206,6 +2362,20 @@ class Handler(BaseHTTPRequestHandler):
             tab_closed(self._json_body().get("tab", "?"))
             self._send(200, {"ok": True})
 
+        elif p == "/api/masteries" and method == "GET":
+            self._send(200, load_masteries())
+
+        elif p == "/api/bonuses" and method == "GET":
+            self._send(200, load_bonuses())
+
+        elif p == "/api/masteries/refresh" and method == "POST":
+            refresh_masteries()
+            self._send(200, dict(mastery_status))
+
+        elif p == "/api/masteries/status" and method == "GET":
+            self._send(200, {**mastery_status,
+                             "build": load_masteries().get("build")})
+
         elif p == "/api/update" and method == "GET":
             self._send(200, check_update(force="force" in q))
 
@@ -2453,6 +2623,13 @@ nav button.locked{opacity:.38;cursor:not-allowed}
 .helppop .mi:hover{background:var(--panel);color:var(--acc)}
 .helppop .sep{border-top:1px solid var(--line);margin:4px 0}
 .helppop .info{padding:8px 12px;font-size:12.5px}
+.ipanel{border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel2);
+  margin:0 0 14px;overflow:hidden}
+.ipanel>.ihead{padding:7px 14px;border-bottom:1px solid var(--line);font-weight:700;
+  letter-spacing:1px;text-transform:uppercase;font-size:12px;color:var(--gold);
+  display:flex;gap:10px;align-items:baseline;white-space:nowrap}
+.ipanel>.ihead small{font-weight:400;letter-spacing:0;text-transform:none;color:var(--dim);font-size:12px}
+.ipanel>.ibody{padding:10px 14px}
 .hchar{display:flex;align-items:center;gap:8px}
 .hchar img{width:30px;height:30px;border-radius:var(--radius-sm);outline:1px solid var(--acc)}
 .themerow{display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap}
@@ -2577,6 +2754,20 @@ window.addEventListener("pagehide",()=>{
   try{ navigator.sendBeacon("/api/closing",
     new Blob([JSON.stringify({tab:TAB_ID})],{type:"application/json"})); }catch(e){}
 });
+async function refreshMasteries(){
+  helpMain(`<span class="dim">Downloading CCP's static data (about 100 MB)…</span>`);
+  try{ await api("/api/masteries/refresh",{method:"POST"}); }catch(e){ helpMain(`<span class="bad">${esc(e.message)}</span>`); return; }
+  const poll=async()=>{
+    const r=await api("/api/masteries/status");
+    if(r.state==="running"){
+      helpMain(`<span class="dim">Downloading… ${r.total?Math.round(r.done/r.total*100)+"%":""}</span>`);
+      setTimeout(poll,1500); return; }
+    if(r.state==="error"){ helpMain(`<span class="bad">Failed: ${esc(r.error)}</span>`); return; }
+    state.mast=null; helpMain(`<span class="good">Ship mastery data updated</span> (build ${esc(String(r.build||"?"))}).`);
+    if(state._info&&$("#itemInfo")) renderItemInfo();
+  };
+  setTimeout(poll,1500);
+}
 async function toggleCloseOnExit(){
   const on=!state.status.quit_on_close;
   await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2593,6 +2784,7 @@ function helpMain(extra){
   $("#helpPop").innerHTML=`
     <div class="mi" onclick="helpUpdate()">Check for updates…</div>
     <div class="mi" onclick="openSettings()">Setup &amp; loyalty points…</div>
+    <div class="mi" onclick="refreshMasteries()">Refresh ship mastery data</div>
     <div class="mi" onclick="toggleCloseOnExit()">Close on Exit:
       <b style="color:${st.quit_on_close?"var(--good)":"var(--dim)"}">${
       st.quit_on_close?"ON":"OFF"}</b></div>
@@ -4698,6 +4890,172 @@ async function loadItemPrice(tid){
     const p=r.prices[String(tid)]; _jitaPrice[tid]={t:Date.now(),p}; show(p);
   }catch(e){ show({error:e.message}); }
 }
+/* ---- ship mastery (data from CCP's static data export) ---- */
+async function ensureMasteries(){
+  if(state.mast||state._mastLoading) return;
+  state._mastLoading=true;
+  try{ state.mast=await api("/api/masteries"); }catch(e){ state.mast={ships:{},certs:{}}; }
+  state._mastLoading=false;
+  if(state._info&&$("#itemInfo")) renderItemInfo();
+}
+/* EVE-style skill tree: the skill, then the prerequisites you still need, indented */
+function skillTreeHtml(cid,needs,noFold){          // needs: [[skillId, level, have]]
+  const sk=state.catalog&&state.catalog.skills; if(!sk) return needs.map(([sid,lv,have])=>
+    `${esc(skillName(sid))} ${roman(lv)}`).join(" · ");
+  const seen=new Set(); let count=0;
+  const node=(sid,lv,depth)=>{
+    const have=charLevel(cid,sid), ok=have>=lv, again=seen.has(sid);
+    let html=`<div style="margin-left:${depth*18}px;white-space:nowrap">${depth?`<span class="dim">↳ </span>`:""}<span class="${
+      ok?"good":"bad"}">${ok?"✔":"✗"}</span> ${esc(skillName(sid))} ${roman(lv)}${
+      ok?"":` <span class="dim">(you have ${have?roman(have):"nothing"})</span>`}${
+      again&&!ok?` <span class="dim">(listed above)</span>`:""}</div>`;
+    count++;
+    if(!ok&&!again&&sk[sid]){
+      seen.add(sid);
+      const pre=sk[sid].prereqs||[];
+      // unmet prerequisites first, then a one-line summary of the met ones
+      pre.filter(([pid,pl])=>charLevel(cid,pid)<pl).forEach(([pid,pl])=>{ html+=node(pid,pl,depth+1); });
+      const met=pre.filter(([pid,pl])=>charLevel(cid,pid)>=pl);
+      if(met.length) html+=`<div class="dim" style="margin-left:${(depth+1)*18}px;font-size:11.5px">✔ ${
+        met.map(([pid,pl])=>esc(skillName(pid))+" "+roman(pl)).join(", ")} already trained</div>`;
+    }
+    return html;
+  };
+  const html=needs.map(([sid,lv])=>node(sid,lv,0)).join("");
+  return count>14&&!noFold?`<details><summary class="dim" style="cursor:pointer">Show the ${count} skills to train
+    (with prerequisites)</summary>${html}</details>`:html;
+}
+function masteryNeeds(shipId,tier){          // tier 0..4 -> {skillId: level needed}
+  const m=state.mast, certs=(m.ships[shipId]||[])[tier]||[], need={};
+  certs.forEach(cid=>{
+    const c=m.certs[cid]; if(!c) return;
+    Object.entries(c.s).forEach(([sid,lv])=>{
+      need[sid]=Math.max(need[sid]||0,lv[tier]||0); });
+  });
+  return need;
+}
+function masteryCalc(cid,shipId){
+  const m=state.mast; if(!m||!m.ships[shipId]) return null;
+  const tiers=m.ships[shipId].length; let level=0, missing=null;
+  for(let t=0;t<tiers;t++){
+    const need=masteryNeeds(shipId,t), miss=[];
+    Object.entries(need).forEach(([sid,lv])=>{
+      const have=charLevel(cid,sid); if(have<lv) miss.push([+sid,lv,have]); });
+    if(miss.length){ missing=miss; break; }
+    level=t+1;
+  }
+  return {level,tiers,missing};
+}
+function masteryMissingUpTo(cid,shipId,tiers){   // everything missing to reach tier N
+  const need={};
+  for(let t=0;t<tiers;t++) Object.entries(masteryNeeds(shipId,t)).forEach(([sid,lv])=>{
+    need[sid]=Math.max(need[sid]||0,lv); });
+  return Object.entries(need).filter(([sid,lv])=>charLevel(cid,sid)<lv)
+    .map(([sid,lv])=>[+sid,lv,charLevel(cid,sid)]);
+}
+state._mt=state._mt||{};
+async function fillMasteryTimes(){
+  const d=state._info; if(!d) return;
+  for(const el of document.querySelectorAll("[data-mt]")){
+    const [cid,tiers]=el.dataset.mt.split("|"), ch=state.chars[cid]; if(!ch) continue;
+    const key=cid+"|"+d.type_id+"|"+tiers+"|"+(ch.total_sp||0);
+    if(state._mt[key]){ el.textContent=state._mt[key]; continue; }
+    const miss=masteryMissingUpTo(cid,String(d.type_id),+tiers);
+    try{
+      const r=await api("/api/plan/compute",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({entries:miss.map(([sid,lv])=>[sid,lv]),skills:ch.skills,
+          attributes:ch.attributes,remap:false})});
+      state._mt[key]=dur(r.total_minutes)+" of training";
+    }catch(e){ state._mt[key]="training time unavailable"; }
+    if(el.isConnected) el.textContent=state._mt[key];
+  }
+}
+function planMastery(cid,shipId,toTier){     // add everything missing up to tier N
+  state.planChar=cid;
+  for(let t=0;t<toTier;t++){
+    Object.entries(masteryNeeds(shipId,t)).forEach(([sid,lv])=>{
+      if(charLevel(cid,sid)>=lv) return;
+      const i=state.plan.findIndex(e=>e[0]===+sid);
+      if(i>=0) state.plan[i][1]=Math.max(state.plan[i][1],lv); else state.plan.push([+sid,lv]);
+    });
+  }
+  toast("Added to your skill plan — open the Skill Planner to see the training time.");
+  go("planner");
+}
+async function ensureBonuses(){
+  if(state.bon||state._bonLoading) return;
+  state._bonLoading=true;
+  try{ state.bon=await api("/api/bonuses"); }catch(e){ state.bon={types:{}}; }
+  state._bonLoading=false;
+  if(state._info&&$("#itemInfo")) renderItemInfo();
+}
+function fmtBonus(v,u){
+  if(v==null) return "";
+  const n=Math.round(v*100)/100;
+  return u==="%"?`${n}%`:u==="+"?`+${n}`:u==="x"?`${n}x`:`${n}${u}`;
+}
+function ibox(title,sub,body){
+  return `<div class="ipanel"><div class="ihead">${title}${sub?`<small>${sub}</small>`:""}</div>
+    <div class="ibody">${body}</div></div>`;
+}
+function bonusSection(d){
+  if(d.category!=="Ship") return "";
+  if(!state.bon){ ensureBonuses(); return ""; }
+  const rec=state.bon.types[d.type_id]; if(!rec) return "";
+  const cid=state.activeChar, c=(state.status.characters||[]).find(x=>String(x.character_id)===String(cid));
+  if(!c) return "";
+  if(!state.chars[cid]) return `<p class="dim">Loading ${esc(c.name)}'s skills…</p>`;
+  const line=(v,u,t,lvl)=>{               // a bonus that scales per skill level
+    const cur=v*lvl, max=v*5;
+    return `<div style="margin:2px 0 2px 14px">${fmtBonus(v,u)} ${esc(t)} <span class="dim">per level</span>
+      &nbsp;→&nbsp; <b class="${lvl?"good":"dim"}">${lvl?fmtBonus(cur,u):"none yet"}</b>
+      <span class="dim">now${lvl<5?`, ${fmtBonus(max,u)} at V`:" (maximum)"}</span></div>`; };
+  let html="";
+  (rec.r||[]).length&&(html+=`<div style="margin:0 0 10px"><b>Role bonuses</b>${rec.r.map(([v,u,t])=>
+    `<div style="margin:2px 0 2px 14px">${v==null?"":fmtBonus(v,u)+" "}${esc(t)}</div>`).join("")}</div>`);
+  (rec.s||[]).forEach(([sid,bl])=>{
+    const lvl=charLevel(cid,sid);
+    html+=`<div style="margin:0 0 10px"><b>${esc(skillName(sid))}</b>
+      <span class="dim">— you have ${lvl?roman(lvl):"it untrained"}</span>${
+      bl.map(([v,u,t])=>line(v,u,t,lvl)).join("")}</div>`;
+  });
+  (rec.m||[]).length&&(html+=`<div style="margin:0 0 4px"><b>Other</b>${rec.m.map(([v,u,t])=>
+    `<div style="margin:2px 0 2px 14px">${v!=null?fmtBonus(v,u)+" ":""}${esc(t)}</div>`).join("")}</div>`);
+  return ibox("Ship bonuses",`at ${esc(c.name)}'s current skills`,html);
+}
+function masterySection(d){
+  if(d.category!=="Ship") return "";
+  if(!state.mast){ ensureMasteries(); return `<p class="dim">Loading ship mastery data…</p>`; }
+  if(!state.mast.ships[d.type_id]) return "";
+  const rows=state.status.characters.map(c=>{
+    if(!state.chars[c.character_id]) return `<div class="dim">${esc(c.name)}: loading…</div>`;
+    const r=masteryCalc(c.character_id,d.type_id); if(!r) return "";
+    const pills=Array.from({length:r.tiers},(_,i)=>`<span class="lvlpill" style="${
+      i<r.level?"background:var(--gold);color:var(--panel);outline-color:var(--gold)":""}">${roman(i+1)}</span>`).join(" ");
+    const cidn=c.character_id, sh=String(d.type_id), nxt=r.level+1;
+    let next;
+    if(r.level>=r.tiers) next=`<div class="good" style="margin-top:4px">Fully mastered.</div>`;
+    else{
+      const nextMiss=masteryMissingUpTo(cidn,sh,nxt);
+      next=`<div style="margin-top:8px"><div style="margin-bottom:2px"><b>Next: mastery ${roman(nxt)}</b>
+        <span class="dim"> · ${nextMiss.length} skill${nextMiss.length===1?"":"s"} · <span data-mt="${cidn}|${nxt}">calculating…</span></span></div>
+        ${skillTreeHtml(cidn,nextMiss)}</div>`;
+      if(nxt<r.tiers){
+        const topMiss=masteryMissingUpTo(cidn,sh,r.tiers);
+        next+=`<details style="margin-top:8px"><summary style="cursor:pointer"><b>Mastery ${roman(r.tiers)}</b>
+          <span class="dim"> · ${topMiss.length} skills · <span data-mt="${cidn}|${r.tiers}">calculating…</span></span></summary>
+          <div style="margin-top:4px">${skillTreeHtml(cidn,topMiss,true)}</div></details>`;
+      }
+      next+=`<div class="row" style="margin-top:8px">
+        <button class="btn sec" onclick="planMastery('${cidn}','${sh}',${nxt})">Plan mastery ${roman(nxt)}</button>
+        ${nxt<r.tiers?`<button class="btn sec" onclick="planMastery('${cidn}','${sh}',${r.tiers})">Plan all the way to ${roman(r.tiers)}</button>`:""}
+      </div>`;
+    }
+    return `<div style="margin:0 0 12px"><b>${esc(c.name)}</b> &nbsp; ${pills}${next}</div>`;
+  }).join("");
+  return ibox("Ship mastery","from CCP's certificate data",
+    rows+`<p class="muted-note">Data: CCP static data build ${esc(String(state.mast.build||"?"))}.</p>`);
+}
 function renderItemInfo(){
   const d=state._info, el=$("#itemInfo"); if(!d||!el) return;
   const isShip=d.category==="Ship";
@@ -4770,13 +5128,14 @@ function renderItemInfo(){
       <div>
         ${wheel?"":`<img class="portrait" style="width:96px;height:96px;margin-bottom:10px"
           src="https://images.evetech.net/types/${d.type_id}/icon?size=128">`}
-        <h3 style="margin:0 0 8px">${isShip?"Can I fly this?":"Can I use this?"}</h3>
-        ${skillHtml}
-        ${desc?`<div class="dim" style="white-space:pre-line;margin-top:22px;
-          padding-top:18px;border-top:1px solid var(--line);font-size:12.5px">${esc(desc)}</div>`:""}
+        ${ibox(isShip?"Can I fly this?":"Can I use this?","",skillHtml)}
+        ${bonusSection(d)}
+        ${masterySection(d)}
+        ${desc?ibox("Description","",`<div class="dim" style="white-space:pre-line;font-size:12.5px">${esc(desc)}</div>`):""}
       </div>
     </div></div>`;
   fillTrainingNeeds();
+  fillMasteryTimes();
   loadItemPrice(d.type_id);
 }
 async function fillTrainingNeeds(){
