@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.0
+## 1.6.0
 - Skills tab: Queue (timeline), My skills (by group, level pips) and Planner as sub-tabs; Overview shows the training skill with a link.
 - Market: Hub scanner finds items cheap in one hub and dear in another (whole market or chosen item groups), with activity, tax and cargo filters.
 - Overview tab redesigned as a single-character sheet: portrait, attribute tiles with icons (training attributes outlined), implants in their 10 slots, skill queue.

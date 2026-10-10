@@ -3026,6 +3026,13 @@ th.sortable:hover{color:var(--acc)}
 <div id="toast"></div>
 <script>
 "use strict";
+/* Items without a picture (ship skins etc.) answer 404 from the image
+   server - hide the broken image instead of showing an empty frame. */
+document.addEventListener("error",e=>{
+  const t=e.target;
+  if(t&&(t.tagName==="IMG"||t.tagName==="image")&&/images\.evetech\.net/.test(t.currentSrc||t.src||t.getAttribute("href")||""))
+    t.style.display="none";
+},true);
 const $ = s => document.querySelector(s);
 const state = {status:null, chars:{}, cards:{}, screen:"app", popFor:null, catalog:null, tab:"characters",
                plan:[], plans:{}, planChar:null, openGroups:{},
