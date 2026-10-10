@@ -1,4 +1,4 @@
-# EveWatch — your personal EVE-Online Character tracker and Market manager
+# EveWatch — your personal EVEMon
 
 A lightweight EVEMon-style tool that runs on your own computer. It monitors
 skill queues for all your characters, plans skills (with training times and
@@ -88,7 +88,8 @@ press Ctrl+C in it) to stop.
 - **Wallet** also has a date range, entry-type filter and an income summary.
   EveWatch archives your journal locally, so history beyond ESI's ~30 days
   accumulates over time. Optional loyalty-point tracking needs
-  `esi-characters.read_loyalty.v1`
+  `esi-characters.read_loyalty.v1` (loyalty points) and
+  `esi-characters.read_agents_research.v1` (research points)
   added in the developer portal, switched on under Help → Setup & loyalty points, then characters
   re-added.
 - **Appraisal** processes big lists in batches and shows results as it goes.

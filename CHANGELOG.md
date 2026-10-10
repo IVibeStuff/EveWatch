@@ -1,6 +1,7 @@
 # Changelog
 
-## 1.2.0
+## 1.3.0
+- LP Store tab: research-agent points → datacores (100 RP + 10,000 ISK each) priced at all market hubs. Optional research-points permission.
 - Setup and loyalty-points settings move to Help → "Setup & loyalty points…" once characters exist (first-launch flow unchanged).
 - Help → "Close on Exit" (default OFF): when ON, EveWatch quits after its last browser tab closes.
 - Start-up order: Characters tab first (Setup lives there), other tabs unlock once a character is selected; header shows the active character only; Add/Remove/theme are on the Characters screen. Old Characters dashboard is now "Overview".

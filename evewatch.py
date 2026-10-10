@@ -103,8 +103,19 @@ EXTRA_SCOPES = [
 ]
 
 
+RESEARCH_SCOPE = "esi-characters.read_agents_research.v1"
+# game rules for converting research points into datacores
+RP_PER_DATACORE = 100
+ISK_PER_DATACORE = 10000
+
+
 def active_scopes():
-    return SCOPES + (EXTRA_SCOPES if config.get("scope_extras") else [])
+    sc = list(SCOPES)
+    if config.get("scope_extras"):
+        sc += EXTRA_SCOPES
+    if config.get("scope_research"):
+        sc.append(RESEARCH_SCOPE)
+    return sc
 
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (personal local tool)"
 
@@ -835,6 +846,63 @@ def char_loyalty(char_id):
     out = [r for r in out
            if str(r["corporation"]).lower() not in HIDDEN_LP_CORPS]
     out.sort(key=lambda r: -r["points"])
+    return out
+
+
+_datacore_ids = {}                # datacore name (lowercase) -> type id
+
+
+def char_research(char_id):
+    """Research-point agents with their current RP and the datacore each one
+    pays out (the datacore is named after the research skill)."""
+    import calendar
+    tok = get_access_token(char_id)
+    cid = int(char_id)
+    rows, _ = esi_fetch(f"/characters/{cid}/agents_research/", tok,
+                        use_cache=False)
+    out = {"rp_per_datacore": RP_PER_DATACORE,
+           "isk_per_datacore": ISK_PER_DATACORE, "agents": []}
+    if not rows:
+        return out
+    names = esi_names([r["agent_id"] for r in rows])
+
+    def corp_of(aid):
+        try:
+            pub, _ = esi_fetch(f"/characters/{aid}/")
+            return pub.get("corporation_id")
+        except RuntimeError:
+            return None
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        corps = dict(zip([r["agent_id"] for r in rows],
+                         pool.map(corp_of, [r["agent_id"] for r in rows])))
+    cnames = esi_names([c for c in corps.values() if c])
+    skills = {r["skill_type_id"]: get_type_info(r["skill_type_id"])["name"]
+              for r in rows}
+    save_json(TYPES_PATH, type_info)
+    want = [f"Datacore - {n}" for n in skills.values()
+            if f"datacore - {n}".lower() not in _datacore_ids]
+    if want:
+        for k, h in _ids_lookup(want).items():
+            _datacore_ids[k] = h["id"]
+    now = time.time()
+    for r in rows:
+        sk = skills[r["skill_type_id"]]
+        started = calendar.timegm(time.strptime(r["started_at"],
+                                                "%Y-%m-%dT%H:%M:%SZ"))
+        ppd = r.get("points_per_day", 0) or 0
+        rp = r.get("remainder_points", 0) + ppd * max(0, now - started) / 86400
+        dc_name = f"Datacore - {sk}"
+        out["agents"].append({
+            "agent": names.get(r["agent_id"], {}).get("name", str(r["agent_id"])),
+            "corporation": cnames.get(corps.get(r["agent_id"]), {}).get("name", ""),
+            "skill": sk, "datacore": dc_name,
+            "datacore_id": _datacore_ids.get(dc_name.lower()),
+            "ppd": round(ppd, 2), "rp": round(rp, 1),
+            "ready": int(rp // RP_PER_DATACORE),
+            "days_to_next": round((RP_PER_DATACORE - rp % RP_PER_DATACORE)
+                                  / ppd, 1) if ppd > 0 else None,
+        })
+    out["agents"].sort(key=lambda a: -a["rp"])
     return out
 
 
@@ -1923,6 +1991,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scopes": SCOPES,
                 "extra_scopes": EXTRA_SCOPES,
                 "scope_extras": bool(config.get("scope_extras")),
+                "scope_research": bool(config.get("scope_research")),
+                "research_scope": RESEARCH_SCOPE,
                 "characters": [{"character_id": r["character_id"],
                                 "name": r["name"]} for r in tokens.values()],
                 "catalog": ({"state": "done",
@@ -1936,6 +2006,8 @@ class Handler(BaseHTTPRequestHandler):
                 config["client_id"] = body["client_id"].strip()
             if "scope_extras" in body:
                 config["scope_extras"] = bool(body["scope_extras"])
+            if "scope_research" in body:
+                config["scope_research"] = bool(body["scope_research"])
             if "quit_on_close" in body:
                 config["quit_on_close"] = bool(body["quit_on_close"])
             save_json(CONFIG_PATH, config)
@@ -1968,6 +2040,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, char_journal(char_id))
             elif sub == "loyalty":
                 self._send(200, char_loyalty(char_id))
+            elif sub == "research":
+                self._send(200, char_research(char_id))
             elif sub == "standings":
                 self._send(200, char_standings(char_id))
             elif sub == "blueprints":
@@ -2809,26 +2883,29 @@ function setupHtml(open){
     on this computer, in the <b>evewatch_data</b> folder next to the app.</p>
   </div>
   <div class="card" ${open?"":'data-defcollapsed="1"'}>
-    <h2>Optional: loyalty points</h2>
-    <p>These two extra read-only permissions let the Wallet tab show your LP
-    balances (with trends):<br>
-    ${(st.extra_scopes||[]).map(s=>`<code>${s}</code>`).join(" ")}</p>
+    <h2>Optional permissions: loyalty points &amp; research points</h2>
+    <p>Each of these read-only permissions unlocks a feature on the LP Store tab:
+    loyalty-point balances, and research-agent points (with datacore values).<br>
+    ${(st.extra_scopes||[]).concat([st.research_scope]).filter(Boolean).map(s=>`<code>${s}</code>`).join(" ")}</p>
     <p class="muted-note">Order matters: first tick them on your developer
     application at developers.eveonline.com (under esi-characters), then switch
     this on, then add each character again with the + slot above. If you switch
     it on before the portal is updated, EVE's login will reject the request.</p>
-    <label><input type="checkbox" id="extrasBox"
+    <label style="display:block"><input type="checkbox" id="extrasBox"
       ${st.scope_extras?"checked":""} onchange="saveExtras()">
       Request the loyalty-points permission when logging in</label>
+    <label style="display:block;margin-top:6px"><input type="checkbox" id="researchBox"
+      ${st.scope_research?"checked":""} onchange="saveExtras()">
+      Request the research-points permission when logging in</label>
   </div>`;
 }
 async function saveExtras(){
-  const on=$("#extrasBox").checked;
+  const on=$("#extrasBox").checked, rs=$("#researchBox").checked;
   await api("/api/config",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({scope_extras:on})});
-  state.status.scope_extras=on;
-  toast(on?"On — enable the scopes in the portal, then re-add your characters."
+    body:JSON.stringify({scope_extras:on,scope_research:rs})});
+  state.status.scope_extras=on; state.status.scope_research=rs;
+  toast(on||rs?"Saved — enable the permissions in the developer portal first, then re-add your characters."
           :"Off — logins will use the standard permissions only.");
 }
 async function saveCid(){
@@ -3703,6 +3780,7 @@ Amarr VIII (Oris) - Emperor Family Academy
 }
 
 /* ---------------- LP Store ---------------- */
+const RP = {agents:[], prices:{}, hubs:[], rpEach:100, iskEach:10000};
 const LP = {corp:null, offers:[], prices:{}, running:false, cancel:false,
             sort:"per", dir:-1, myLP:{}};
 function rLPStore(m){
@@ -3724,9 +3802,79 @@ function rLPStore(m){
     loyalty-points scope (Help → Setup & loyalty points); searching by name doesn't.</p>
     <div id="lpStatus"></div>
     <div id="lpControls"></div>
-    <div id="lpOut"></div></div>`;
+    <div id="lpOut"></div></div>
+    <div class="card"><h2>Research points → datacores</h2>
+    <div class="row">
+      <button class="btn sec" onclick="rpLoad()">Load research agents for the character above</button>
+      <span class="dim">Sell datacores at</span>
+      <select id="rpBasis" onchange="rpRender()">
+        <option value="sell">lowest sell order</option>
+        <option value="buy">highest buy order (instant sell)</option></select>
+      <span id="rpStatus" class="dim"></span>
+    </div>
+    <p class="muted-note">Each datacore costs ${RP.rpEach} research points banked with that
+    agent plus a ${num(RP.iskEach)} ISK fee, and is always the datacore of the research skill
+    you chose with the agent. Current RP = the agent's banked remainder plus points per day
+    since you started. Prices come from every market location on the Market tab. Needs the
+    research-points permission (Help → Setup &amp; loyalty points).</p>
+    <div id="rpOut"></div></div>`;
   lpFillCorps();
   if(LP.offers.length){ lpControls(); lpRender(); }
+}
+async function rpLoad(){
+  const cid=$("#lpChar")?.value; if(!cid){ toast("Add a character first."); return; }
+  $("#rpStatus").textContent="Loading agents…"; $("#rpOut").innerHTML="";
+  let r;
+  try{ r=await api("/api/character/"+cid+"/research"); }
+  catch(e){ $("#rpStatus").innerHTML=`<span class="bad">${esc(e.message)}</span>`;
+    toast("Research points: "+e.message+" (needs the research-points permission — Help → Setup & loyalty points)");
+    return; }
+  RP.agents=r.agents; RP.rpEach=r.rp_per_datacore; RP.iskEach=r.isk_per_datacore;
+  if(!r.agents.length){ $("#rpStatus").textContent="This character has no research agents."; return; }
+  const ids=[...new Set(r.agents.map(a=>a.datacore_id).filter(Boolean))];
+  for(let i=0;i<ids.length;i++){
+    $("#rpStatus").textContent=`Pricing datacores ${i+1} / ${ids.length}…`;
+    try{ RP.prices[ids[i]]=await api("/api/market/compare?type_id="+ids[i]); }
+    catch(e){ RP.prices[ids[i]]={rows:[],error:e.message}; }
+    rpRender();
+  }
+  $("#rpStatus").textContent=""; rpRender();
+}
+function rpRender(){
+  const el=$("#rpOut"); if(!el||!RP.agents.length) return;
+  const basis=$("#rpBasis")?.value||"sell";
+  const hubs=[]; Object.values(RP.prices).forEach(p=>(p.rows||[]).forEach(r=>{
+    if(!hubs.some(h=>h.station_id===r.station_id)) hubs.push({station_id:r.station_id,name:r.system||r.name}); }));
+  let total=0, totalReady=0;
+  const rows=RP.agents.map(a=>{
+    const p=a.datacore_id?RP.prices[a.datacore_id]:null;
+    const per={}; let best=null;
+    ((p&&p.rows)||[]).forEach(r=>{
+      const v=r[basis]; per[r.station_id]=v;
+      if(v!=null&&(best==null||v>best.v)) best={v,name:r.system||r.name}; });
+    const net=best?a.ready*(best.v-RP.iskEach):null;
+    if(net!=null){ total+=net; } totalReady+=a.ready;
+    return {a,per,best,net};
+  });
+  el.innerHTML=`<table><tr><th>Agent</th><th>Skill / datacore</th><th class="num">RP now</th>
+    <th class="num">RP/day</th><th class="num">Datacores ready</th><th class="num">Next in</th>
+    ${hubs.map(h=>`<th class="num">${esc(h.name)}</th>`).join("")}
+    <th>Best hub</th><th class="num">Net value (ready)</th></tr>`+
+  rows.map(({a,per,best,net})=>`<tr>
+    <td>${esc(a.agent)}<div class="dim" style="font-size:11.5px">${esc(a.corporation)}</div></td>
+    <td>${esc(a.skill)}${a.datacore_id?"":` <span class="warn" title="Couldn't match a datacore named “${esc(a.datacore)}”">⚠</span>`}</td>
+    <td class="num">${num(Math.round(a.rp))}</td><td class="num">${num(a.ppd)}</td>
+    <td class="num"><b>${num(a.ready)}</b></td>
+    <td class="num dim">${a.days_to_next==null?"—":a.days_to_next+" d"}</td>
+    ${hubs.map(h=>`<td class="num ${best&&per[h.station_id]===best.v?"good":""}">${
+      per[h.station_id]==null?"—":num(Math.round(per[h.station_id]))}</td>`).join("")}
+    <td>${best?esc(best.name):"—"}</td>
+    <td class="num ${net>=0?"good":"bad"}">${net==null?"—":isk(Math.round(net))}</td></tr>`).join("")+
+  `<tr><td colspan="${6+hubs.length}"><b>Total</b> — ${num(totalReady)} datacores ready</td>
+    <td></td><td class="num"><b>${isk(Math.round(total))}</b></td></tr></table>
+  <p class="muted-note">Net value = datacores ready × (best hub price − ${num(RP.iskEach)} ISK fee).
+  Before selling, check how much volume the hub can absorb (Market tab) — a thin market
+  will move against you. ⚠ means no datacore was found for that skill's name.</p>`;
 }
 function lpFillCorps(){
   const sel=$("#lpCorpSel"); if(!sel) return;
