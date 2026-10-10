@@ -1,4 +1,4 @@
-# EveWatch — your personal EVEMon
+# EveWatch — your personal EVE-Online Character tracker and Market manager
 
 A lightweight EVEMon-style tool that runs on your own computer. It monitors
 skill queues for all your characters, plans skills (with training times and
@@ -33,7 +33,7 @@ Double-click **Start EveWatch.bat**. A black window opens (that's the app —
 leave it running) and your browser opens http://localhost:8635 automatically.
 
 ### 3. Register your EVE developer application
-EveWatch's Setup tab walks you through this, but in short:
+EveWatch's Characters tab walks you through this (Setup section), but in short:
 
 1. Go to https://developers.eveonline.com/applications and log in with your
    EVE account. (First visit asks you to accept the developer license.)
@@ -56,7 +56,7 @@ EveWatch's Setup tab walks you through this, but in short:
    If you add scopes later, also re-add each character with
    **+ Add character** so their login includes the new permissions.
 6. Callback URL — paste exactly: `http://localhost:8635/callback`
-7. Save, copy the **Client ID**, paste it into EveWatch's Setup tab, click
+7. Save, copy the **Client ID**, paste it into the Setup section of EveWatch's Characters tab, click
    **Save**.
 
 ### 4. Add your characters
@@ -89,7 +89,7 @@ press Ctrl+C in it) to stop.
   EveWatch archives your journal locally, so history beyond ESI's ~30 days
   accumulates over time. Optional loyalty-point tracking needs
   `esi-characters.read_loyalty.v1`
-  added in the developer portal, switched on in Setup, then characters
+  added in the developer portal, switched on under Help → Setup & loyalty points, then characters
   re-added.
 - **Appraisal** processes big lists in batches and shows results as it goes.
 

@@ -1894,7 +1894,8 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         p = url.path.rstrip("/") or "/"
         if p.startswith("/api/") and p not in (
-                "/api/market/index", "/api/contracts/index", "/api/status"):
+                "/api/market/index", "/api/contracts/index", "/api/status",
+                "/api/heartbeat", "/api/closing"):
             last_interactive[0] = time.time()   # let background crawls yield
 
         if p == "/" and method == "GET":
@@ -1916,6 +1917,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "client_id_set": bool(config.get("client_id")),
                 "version": APP_VERSION, "data_dir": DATA_DIR,
+                "quit_on_close": bool(config.get("quit_on_close")),
                 "update_repo": update_repo(),
                 "callback_url": CALLBACK_URL,
                 "scopes": SCOPES,
@@ -1934,6 +1936,8 @@ class Handler(BaseHTTPRequestHandler):
                 config["client_id"] = body["client_id"].strip()
             if "scope_extras" in body:
                 config["scope_extras"] = bool(body["scope_extras"])
+            if "quit_on_close" in body:
+                config["quit_on_close"] = bool(body["quit_on_close"])
             save_json(CONFIG_PATH, config)
             self._send(200, {"ok": True})
 
@@ -2120,6 +2124,14 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("station_id"),
                 [int(t) for t in body.get("type_ids", [])][:40]))
 
+        elif p == "/api/heartbeat" and method == "POST":
+            tab_alive(self._json_body().get("tab", "?"))
+            self._send(200, {"ok": True})
+
+        elif p == "/api/closing" and method == "POST":
+            tab_closed(self._json_body().get("tab", "?"))
+            self._send(200, {"ok": True})
+
         elif p == "/api/update" and method == "GET":
             self._send(200, check_update(force="force" in q))
 
@@ -2301,8 +2313,12 @@ button.btn:hover{filter:brightness(1.15)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .portrait{width:56px;height:56px;border-radius:8px;
   outline:1px solid var(--line)}
-body.selecting nav,body.selecting #activeChar,body.selecting .addbtn,body.selecting #switchBtn{display:none}
-body:not(.selecting) #switchBtn{display:inline-block}
+header{position:relative;z-index:100}
+nav button.locked{opacity:.38;cursor:not-allowed}
+.cs-empty.off{opacity:.4;cursor:not-allowed}
+.cs-empty.off:hover{border-color:var(--line);color:var(--dim);background:transparent}
+.hchip{display:flex;align-items:center;gap:8px;font-weight:600}
+.hchip img{width:30px;height:30px;border-radius:var(--radius-sm);outline:1px solid var(--acc)}
 .cs-wrap{padding-top:10px}
 .cs-title{text-align:center;margin:0 0 26px}
 .cs-title h1{margin:0;font-size:22px;letter-spacing:7px;color:var(--gold)}
@@ -2374,8 +2390,8 @@ body:not(.selecting) #switchBtn{display:inline-block}
 code{background:var(--panel2);padding:2px 6px;border-radius:4px;
   font-size:12.5px;user-select:all}
 .muted-note{font-size:12.5px;color:var(--dim);margin-top:8px}
-#toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);
-  border:1px solid var(--line);border-left:3px solid var(--bad);
+#toast{position:fixed;bottom:20px;right:20px;z-index:300;background:var(--panel2);
+  border:1px solid var(--line);border-left:3px solid var(--gold);
   padding:10px 16px;border-radius:8px;display:none;max-width:420px}
 .steps{max-height:60vh;overflow:auto}
 tr.trained td{background:rgba(76,195,138,.06)}
@@ -2407,8 +2423,6 @@ th.sortable:hover{color:var(--acc)}
   <nav id="nav"></nav>
   <div style="flex:1"></div>
   <div id="activeChar" class="hchar"></div>
-  <button class="btn sec" id="switchBtn" onclick="showSelect()">⇄ Switch character</button>
-  <button class="btn addbtn" onclick="location.href='/login'">+ Add character</button>
   <div class="helpwrap">
     <button class="btn sec" id="helpBtn" onclick="toggleHelp(event)">Help
       <span id="updDot" style="display:none;color:var(--gold)">●</span> ▾</button>
@@ -2424,10 +2438,10 @@ const state = {status:null, chars:{}, cards:{}, screen:"app", popFor:null, catal
                plan:[], plans:{}, planChar:null, openGroups:{},
                locations:null};
 
-const TABS = [["characters","Characters"],["planner","Skill Planner"],
+const TABS = [["characters","Characters"],["overview","Overview"],["planner","Skill Planner"],
               ["assets","Assets"],["wallet","Wallet"],["lpstore","LP Store"],["market","Market"],
               ["itemsearch","Item Search"],["contracts","Contracts"],
-              ["industry","Industry"],["setup","Setup"]];
+              ["industry","Industry"]];
 
 /* ---------------- Per-character themes ---------------- */
 const THEMES=[["classic","Capsuleer Classic"],["glass","Nebula Glass"],
@@ -2464,12 +2478,10 @@ function setActive(cid,rerender){
 function headerChar(){
   const el=$("#activeChar"), cs=state.status?.characters||[];
   if(!el) return;
-  if(!cs.length){ el.innerHTML=""; return; }
-  el.innerHTML=`<img src="https://images.evetech.net/characters/${state.activeChar}/portrait?size=64">
-    <select onchange="setActive(this.value,true)" title="Active character">${
-    cs.map(c=>`<option value="${c.character_id}" ${
-      String(c.character_id)===String(state.activeChar)?"selected":""}>${
-      esc(c.name)}</option>`).join("")}</select>`;
+  const c=cs.find(x=>String(x.character_id)===String(state.activeChar));
+  if(!state.entered||!c){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="hchip"><img src="https://images.evetech.net/characters/${
+    c.character_id}/portrait?size=64" alt=""><span>${esc(c.name)}</span></div>`;
 }
 
 /* ---------------- Help menu / updates ---------------- */
@@ -2480,11 +2492,36 @@ function toggleHelp(ev){
   helpMain(); el.style.display="block";
 }
 document.addEventListener("click",e=>{
+  if(!document.body.contains(e.target)) return;      // target was re-rendered away
   const el=$("#helpPop"); if(el && !e.target.closest(".helpwrap")) el.style.display="none"; });
+const TAB_ID=Math.random().toString(36).slice(2);
+function heartbeat(){
+  fetch("/api/heartbeat",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({tab:TAB_ID})}).catch(()=>{});
+}
+window.addEventListener("pagehide",()=>{
+  try{ navigator.sendBeacon("/api/closing",
+    new Blob([JSON.stringify({tab:TAB_ID})],{type:"application/json"})); }catch(e){}
+});
+async function toggleCloseOnExit(){
+  const on=!state.status.quit_on_close;
+  await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({quit_on_close:on})});
+  state.status.quit_on_close=on;
+  heartbeat(); helpMain(on
+    ?"<b>Close on Exit is ON.</b> EveWatch stops when you close its last browser tab. "+
+     "Background tracking (wallet archive, contract index) only runs while a tab is open."
+    :"<b>Close on Exit is OFF.</b> EveWatch keeps running in the background after you close "+
+     "the tab. Quit it from the tray icon or Help → Quit EveWatch.");
+}
 function helpMain(extra){
   const st=state.status||{};
   $("#helpPop").innerHTML=`
     <div class="mi" onclick="helpUpdate()">Check for updates…</div>
+    <div class="mi" onclick="openSettings()">Setup &amp; loyalty points…</div>
+    <div class="mi" onclick="toggleCloseOnExit()">Close on Exit:
+      <b style="color:${st.quit_on_close?"var(--good)":"var(--dim)"}">${
+      st.quit_on_close?"ON":"OFF"}</b></div>
     <div class="mi" onclick="helpAbout()">About EveWatch</div>
     <div class="mi" onclick="api('/api/open_data',{method:'POST'}).catch(e=>toast(e.message))">
       Open data folder</div>
@@ -2507,7 +2544,7 @@ async function helpUpdate(){
   }catch(e){ helpMain(`<span class="bad">${esc(e.message)}</span>`); }
 }
 function showUpdate(r){
-  if(r.error){ helpMain(`<span class="warn">${esc(r.error)}</span>`); return; }
+  if(r.error){ helpMain(`<span class="warn">${esc(r.error)}</span>`); toast(r.error); return; }
   if(r.newer){
     helpMain(`<b class="good">Version ${esc(r.latest)} is available</b>
       <span class="dim">(you have ${esc(r.current)})</span>
@@ -2518,6 +2555,7 @@ function showUpdate(r){
       <div class="muted-note">Install over the top — your data and logins are kept.</div>`);
   }else{
     helpMain(`<span class="good">You're up to date</span> (version ${esc(r.current)}).`);
+    toast("You're up to date — version "+r.current+" is the latest.");
   }
 }
 async function quietUpdateCheck(){
@@ -2564,28 +2602,39 @@ function until(iso){
 function roman(n){ return ["","I","II","III","IV","V"][n]||n; }
 
 function nav(){
-  $("#nav").innerHTML = TABS.map(([id,label])=>
-    `<button class="${state.tab===id?'active':''}"
-      onclick="go('${id}')">${label}</button>`).join("");
+  $("#nav").innerHTML = TABS.map(([id,label])=>{
+    const locked=id!=="characters"&&!state.entered;
+    return `<button class="${state.tab===id?'active':''} ${locked?'locked':''}"
+      title="${locked?"Select a character on the Characters tab first":""}"
+      onclick="go('${id}')">${label}</button>`; }).join("");
 }
-function go(tab){ state.tab=tab; state.screen="app"; nav(); render(); }
+function go(tab){
+  if(tab!=="characters"&&!state.entered){
+    toast(state.status&&state.status.client_id_set
+      ?"Select a character first."
+      :"Finish the setup on the Characters tab first.");
+    return; }
+  state.tab=tab; nav(); render();
+}
+function softRender(){          // don't wipe a field the user is typing in
+  const a=document.activeElement;
+  if(a&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)&&$("#main").contains(a)) return;
+  render();
+}
 
 /* ---------------- Character select screen ---------------- */
 const SEC_COL={1:"#2fefef",.9:"#48f0c0",.8:"#00ef47",.7:"#00f000",.6:"#8fef2f",
   .5:"#eff000",.4:"#d77700",.3:"#f06000",.2:"#f04800",.1:"#d73000",0:"#f00000"};
 function secColor(v){ return SEC_COL[Math.max(0,Math.min(1,Math.round(v*10)/10))]||"#f00000"; }
-function showSelect(){
-  state.screen="select"; state.popFor=null; render(); refreshCards();
-}
 function refreshCards(){
   for(const c of state.status.characters)
     api("/api/character/"+c.character_id+"/card")
-      .then(d=>{ state.cards[c.character_id]=d; if(state.screen==="select") render(); })
+      .then(d=>{ state.cards[c.character_id]=d; if(state.tab==="characters") softRender(); })
       .catch(()=>{ state.cards[c.character_id]={available:false}; });
 }
 function enterChar(cid){
-  setActive(cid,false); state.screen="app"; state.tab="characters"; state.popFor=null;
-  nav(); render();
+  setActive(cid,false); state.entered=true; state.popFor=null;
+  headerChar(); go("overview");
 }
 function csPop(c){
   if(state.popFor!==c.character_id) return "";
@@ -2631,18 +2680,34 @@ function csCard(c){
       <div class="cs-portrait"><img src="https://images.evetech.net/characters/${cid}/portrait?size=512" alt=""></div>
       ${train}${kv}${ship}${loc}</div></div>`;
 }
+/* Hidden tab, opened from Help: connection setup + optional loyalty points */
+function openSettings(){
+  $("#helpPop").style.display="none";
+  state.tab="setup"; nav(); render();
+}
+function rSetupTab(m){
+  m.innerHTML=`<div style="max-width:980px;margin:0 auto">
+    <p><button class="btn sec" onclick="go('characters')">← Back to characters</button></p>
+    ${setupHtml(true)}</div>`;
+}
+function applyCollapsedLater(){ applyCollapsed(); }
 function rSelect(m){
   const cs=state.status.characters, empties=Math.max(3-cs.length,1);
+  const ready=!!state.status.client_id_set;
   m.innerHTML=`<div class="cs-wrap" onclick="if(state.popFor!==null){state.popFor=null;render()}">
-    <div class="cs-title"><h1>EVEWATCH</h1><p>${cs.length?"Select a character to continue":
-      "Add your first character to get started"}</p></div>
+    <div class="cs-title"><h1>EVEWATCH</h1><p>${!ready?"Step 1: finish the setup below":
+      cs.length?"Select a character to continue":
+      "Step 2: add your first character"}</p></div>
+    ${ready?"":setupHtml()}
     <div class="cs-row">${cs.map(csCard).join("")}${
-      Array.from({length:empties},()=>`<div class="cs-slot"><div class="cs-empty"
-        onclick="location.href='/login'"><div><div class="plus">+</div>
+      Array.from({length:empties},()=>`<div class="cs-slot"><div class="cs-empty ${ready?"":"off"}"
+        onclick="${ready?"location.href='/login'":"toast('Finish the setup first (above).')"}"><div><div class="plus">+</div>
         <small>Add character</small></div></div></div>`).join("")}</div>
+    ${ready&&!cs.length?`<div style="max-width:980px;margin:40px auto 0">${setupHtml(true)}</div>`:""}
     <div class="cs-foot">Characters are added with EVE's official login. Portraits, ships and
     locations come from EVE's API and refresh each time you open this screen. Click the ⚙ on a
     character for its theme.</div></div>`;
+  applyCollapsedLater();
 }
 
 async function boot(){
@@ -2656,23 +2721,23 @@ async function boot(){
     state.activeChar=a; state.planChar=a;
   }
   applyTheme(); headerChar();
-  if(!state.status.client_id_set){ state.tab="setup"; }
-  else state.screen="select";
+  state.tab="characters"; state.entered=false;
   setTimeout(quietUpdateCheck, 4000);
+  heartbeat(); setInterval(heartbeat, 5000);
   if(location.hash==="#update"){ history.replaceState(null,"","/");
     toggleHelp(); helpUpdate(); }
   nav(); render();
   loadCatalog();
   refreshChars();
-  if(state.screen==="select") refreshCards();
+  refreshCards();
   // keep progress bars & countdowns ticking
-  setInterval(()=>{ if(state.screen==="select"||state.tab==="characters") render(); }, 60000);
+  setInterval(()=>{ if(["characters","overview"].includes(state.tab)) softRender(); }, 60000);
 }
 async function loadCatalog(){
   try{
     const d = await api("/api/catalog");
     if(d.skills){ state.catalog=d;
-      if(["planner","characters"].includes(state.tab)||state.screen==="select") render(); }
+      if(["planner","characters","overview"].includes(state.tab)) softRender(); }
     else if(d.state!=="error"){ setTimeout(loadCatalog, 2500); }
     else toast("Skill catalog failed: "+d.error);
   }catch(e){ setTimeout(loadCatalog, 4000); }
@@ -2681,8 +2746,7 @@ async function refreshChars(){
   for(const c of state.status.characters){
     api("/api/character/"+c.character_id+"/summary")
       .then(d=>{ state.chars[c.character_id]=d;
-                 if(state.screen==="select") render();
-                 else if(state.tab==="characters") render();
+                 if(["characters","overview"].includes(state.tab)) softRender();
                  else if(state.tab==="planner") renderSkillPick(); })
       .catch(e=>toast(c.name+": "+e.message));
   }
@@ -2690,11 +2754,9 @@ async function refreshChars(){
 
 function render(){
   const m=$("#main");
-  document.body.classList.toggle("selecting",state.screen==="select");
-  if(state.screen==="select"){ rSelect(m); return; }
-  ({characters:rChars, planner:rPlanner, assets:rAssets,
+  ({characters:rSelect, overview:rChars, planner:rPlanner, assets:rAssets,
     wallet:rWallet, lpstore:rLPStore, market:rMarket, itemsearch:rItemSearch, contracts:rContracts,
-    industry:rIndustry, setup:rSetup}[state.tab])(m);
+    industry:rIndustry, setup:rSetupTab}[state.tab])(m);
   applyCollapsed();
 }
 // click a gold card header to fold/unfold it (remembered per header)
@@ -2711,17 +2773,18 @@ document.addEventListener("click",e=>{
 });
 function applyCollapsed(){
   document.querySelectorAll(".card > h2").forEach(h=>{
-    if(_collapsed[h.textContent.trim()])
-      h.parentElement.classList.add("collapsed");
+    const k=h.textContent.trim(), c=h.parentElement;
+    if(_collapsed[k]===true || (_collapsed[k]===undefined && c.dataset.defcollapsed))
+      c.classList.add("collapsed");
   });
 }
 
 /* ---------------- Setup ---------------- */
-function rSetup(m){
+function setupHtml(open){
   const st=state.status||{};
-  m.innerHTML = `
-  <div class="card">
-    <h2>One-time setup</h2>
+  return `
+  <div class="card" ${st.client_id_set&&!open?'data-defcollapsed="1"':''}>
+    <h2>Setup — connect to EVE</h2>
     <p>EveWatch talks to EVE's official API (ESI). To log characters in you
     need a free <b>developer application</b> — it takes 2 minutes:</p>
     <ol class="setup">
@@ -2745,14 +2808,14 @@ function rSetup(m){
     <p class="muted-note">Your Client ID and character tokens are stored only
     on this computer, in the <b>evewatch_data</b> folder next to the app.</p>
   </div>
-  <div class="card">
+  <div class="card" ${open?"":'data-defcollapsed="1"'}>
     <h2>Optional: loyalty points</h2>
     <p>These two extra read-only permissions let the Wallet tab show your LP
     balances (with trends):<br>
     ${(st.extra_scopes||[]).map(s=>`<code>${s}</code>`).join(" ")}</p>
     <p class="muted-note">Order matters: first tick them on your developer
     application at developers.eveonline.com (under esi-characters), then switch
-    this on, then use “+ Add character” again for each character. If you switch
+    this on, then add each character again with the + slot above. If you switch
     it on before the portal is updated, EVE's login will reject the request.</p>
     <label><input type="checkbox" id="extrasBox"
       ${st.scope_extras?"checked":""} onchange="saveExtras()">
@@ -2775,7 +2838,8 @@ async function saveCid(){
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({client_id:v})});
   state.status.client_id_set=true;
-  toast("Saved. Now click “+ Add character”.");
+  toast("Saved. Now click the + slot to add your first character.");
+  render();
 }
 
 /* ---------------- Characters ---------------- */
@@ -2783,8 +2847,8 @@ function rChars(m){
   const cs=state.status.characters;
   if(!cs.length){
     m.innerHTML=`<div class="card"><h2>No characters yet</h2>
-    <p>Click <b>+ Add character</b> (top right) to log in with EVE SSO.
-    ${state.status.client_id_set?"":"You need to finish <b>Setup</b> first."}
+    <p>Add one from the <b>Characters</b> tab.
+    
     </p></div>`;
     return;
   }
@@ -2868,8 +2932,11 @@ async function removeChar(id){
   state.status.characters=state.status.characters
     .filter(c=>c.character_id!==id);
   delete state.chars[id];
-  if(String(state.activeChar)===String(id) && state.status.characters.length)
-    setActive(state.status.characters[0].character_id,false);
+  if(String(state.activeChar)===String(id)){
+    if(state.status.characters.length)
+      setActive(state.status.characters[0].character_id,false);
+    state.entered=false; state.tab="characters"; headerChar(); nav();
+  }
   render();
 }
 
@@ -3278,7 +3345,7 @@ function rWallet(m){
       <button class="btn sec" onclick="loadLP()">Load loyalty points</button>
     </div>
     <p class="muted-note">Needs the optional loyalty-points scope — switch it on
-    in Setup (and enable them on your developer application first), then
+    under Help → Setup &amp; loyalty points (and enable them on your developer application first), then
     re-add your characters. Each time you load these, EveWatch records a
     snapshot, so changes since your first load are shown as trends.</p>
     <div id="lpOut"></div><div id="stOut"></div></div>`;
@@ -3440,7 +3507,7 @@ async function loadLP(){
 }
 function scopeHint(e){
   toast(/403|scope|token/i.test(e.message)
-    ?"This needs the optional loyalty-points scope — enable them in Setup and re-add the character."
+    ?"This needs the optional loyalty-points scope — enable them under Help → Setup & loyalty points and re-add the character."
     :e.message);
 }
 async function loadStandings(){
@@ -3654,7 +3721,7 @@ function rLPStore(m){
     ISK fee − the cost of any required items) ÷ LP cost, using live Jita 4-4
     prices. Prices load a few items at a time, so a big store takes a minute or
     two; results fill in as they arrive. Loading your corporations needs the
-    loyalty-points scope (see Setup); searching by name doesn't.</p>
+    loyalty-points scope (Help → Setup & loyalty points); searching by name doesn't.</p>
     <div id="lpStatus"></div>
     <div id="lpControls"></div>
     <div id="lpOut"></div></div>`;
@@ -3679,7 +3746,7 @@ async function lpLoadMine(){
     if(!LP.corpList.length) toast("No loyalty points on that character.");
     lpFillCorps();
   }catch(e){ toast("Loyalty points: "+e.message+
-    " (needs the loyalty-points scope — see Setup)"); }
+    " (needs the loyalty-points scope — Help → Setup & loyalty points)"); }
 }
 async function lpSearchCorp(){
   const q=$("#lpCorpQ").value.trim(); if(!q) return;
@@ -4992,11 +5059,58 @@ boot();
 
 SERVER = [None]
 
+# Browser tabs report in with a heartbeat. With "Close on Exit" switched on,
+# EveWatch quits once every tab that was open has closed.
+_tabs = {}                       # tab id -> last heartbeat time
+_tabs_lock = threading.Lock()
+_tab_state = {"seen": False, "last_change": time.time()}
+TAB_STALE = 150                  # seconds: hidden tabs are throttled by browsers
+CLOSE_GRACE = 8                  # seconds: lets a page reload or a second tab appear
+
+
+def tab_alive(tab):
+    with _tabs_lock:
+        _tabs[tab] = time.time()
+        _tab_state.update(seen=True, last_change=time.time())
+
+
+def tab_closed(tab):
+    with _tabs_lock:
+        _tabs.pop(tab, None)
+        _tab_state["last_change"] = time.time()
+
+
+def should_quit_now(now=None):
+    """True when 'Close on Exit' is on and no tab remains."""
+    now = now or time.time()
+    if not config.get("quit_on_close"):
+        return False
+    with _tabs_lock:
+        for t in [t for t, ts in _tabs.items() if now - ts > TAB_STALE]:
+            del _tabs[t]
+            _tab_state["last_change"] = now
+        return (_tab_state["seen"] and not _tabs
+                and now - _tab_state["last_change"] > CLOSE_GRACE)
+
+
+def _tab_watcher():
+    while True:
+        time.sleep(2)
+        if should_quit_now():
+            print("Last browser tab closed - quitting (Close on Exit is on).")
+            request_shutdown()
+            return
+
 
 def request_shutdown():
     srv = SERVER[0]
     if srv:
         threading.Thread(target=srv.shutdown, daemon=True).start()
+    try:
+        import evewatch_tray
+        evewatch_tray.stop()                  # remove the tray icon too
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _setup_logging():
@@ -5050,6 +5164,7 @@ def main():
     print("Your data lives in:", DATA_DIR)
     threading.Thread(target=archiver_loop, daemon=True).start()
     threading.Thread(target=seed_hubs, daemon=True).start()
+    threading.Thread(target=_tab_watcher, daemon=True).start()
     if "--no-browser" not in args:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     use_tray = FROZEN or "--tray" in args

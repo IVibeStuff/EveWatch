@@ -1,6 +1,10 @@
 # Changelog
 
-## 1.1.0
+## 1.2.0
+- Setup and loyalty-points settings move to Help → "Setup & loyalty points…" once characters exist (first-launch flow unchanged).
+- Help → "Close on Exit" (default OFF): when ON, EveWatch quits after its last browser tab closes.
+- Start-up order: Characters tab first (Setup lives there), other tabs unlock once a character is selected; header shows the active character only; Add/Remove/theme are on the Characters screen. Old Characters dashboard is now "Overview".
+- Fixed: Help menu hidden behind the page; "Check for updates" result vanished.
 - Character select screen on start-up (portrait, training, wallet, ship, location);
   per-character theme and Remove live in each card's ⚙ menu; "Switch character" button in the header.
 - Installable Windows and Linux builds with a tray icon.
