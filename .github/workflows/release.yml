@@ -1,0 +1,76 @@
+name: Build installers
+
+# Push a tag like v1.2.0 (see RELEASING.md) and GitHub builds the Windows
+# installer and the Linux package, then attaches them to a Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:       # manual test build from the Actions tab (no release)
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Stamp version and repository
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VER="${GITHUB_REF_NAME#v}"; else VER="0.0.0"; fi
+          sed -i "s|@@GITHUB_REPO@@|${GITHUB_REPOSITORY}|" evewatch.py
+          sed -i "s|^APP_VERSION = .*|APP_VERSION = \"${VER}\"|" evewatch.py
+          echo "VER=$VER" >> "$GITHUB_ENV"
+      - run: pip install -r requirements-build.txt
+      - run: pyinstaller packaging/evewatch.spec --noconfirm
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VER" packaging\windows\evewatch.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/installer/*.exe
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*.exe
+          generate_release_notes: true
+
+  linux:
+    runs-on: ubuntu-22.04      # older glibc = runs on more distributions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Stamp version and repository
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VER="${GITHUB_REF_NAME#v}"; else VER="0.0.0"; fi
+          sed -i "s|@@GITHUB_REPO@@|${GITHUB_REPOSITORY}|" evewatch.py
+          sed -i "s|^APP_VERSION = .*|APP_VERSION = \"${VER}\"|" evewatch.py
+          echo "VER=$VER" >> "$GITHUB_ENV"
+      - run: pip install -r requirements-build.txt
+      - run: pyinstaller packaging/evewatch.spec --noconfirm
+      - name: Package
+        run: |
+          D="EveWatch-linux-x86_64-$VER"
+          mkdir -p "pkg/$D"
+          cp -r dist/EveWatch "pkg/$D/EveWatch"
+          cp packaging/linux/install.sh packaging/linux/uninstall.sh packaging/linux/evewatch.desktop "pkg/$D/"
+          cp assets/icon.png "pkg/$D/icon.png"
+          tar -C pkg -czf "$D.tar.gz" "$D"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: "*.tar.gz"
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.tar.gz"
+          generate_release_notes: true

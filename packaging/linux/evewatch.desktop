@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EveWatch
+Comment=Personal EVE Online tool (skills, wallet, market)
+Exec=@EXEC@
+Icon=evewatch
+Terminal=false
+Categories=Game;Utility;

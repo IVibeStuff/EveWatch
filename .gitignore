@@ -1,0 +1,14 @@
+# YOUR PRIVATE DATA - never commit (contains login tokens and your Client ID)
+evewatch_data/
+
+# Python / build output
+__pycache__/
+*.pyc
+build/
+dist/
+pkg/
+*.spec.bak
+.venv/
+
+# Local scratch
+style_mockups.html

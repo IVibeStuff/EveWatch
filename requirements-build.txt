@@ -1,0 +1,6 @@
+# Only needed to BUILD the installers (the app itself uses just the Python
+# standard library). pystray/Pillow give the installed app its tray icon.
+pyinstaller>=6.6
+pystray>=0.19
+Pillow>=10
+python-xlib>=0.33; sys_platform == "linux"
