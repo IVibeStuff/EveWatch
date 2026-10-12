@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8635
 APP_NAME = "EveWatch"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 # Filled in automatically when the installers are built on GitHub; when running
 # from source you can set "update_repo": "user/repo" in config.json instead.
 GITHUB_REPO = "@@GITHUB_REPO@@"
@@ -1336,6 +1336,102 @@ def char_jobs(char_id):
         "status": r.get("status", ""),
         "end_date": r.get("end_date", ""),
     } for r in rows]
+
+
+def _has_contracts_scope(char_id):
+    scopes = tokens[str(char_id)].get("scopes")
+    return scopes is None or CONTRACTS_SCOPE in scopes   # None: added before we tracked scopes
+
+
+def _scope_error(e):
+    return " 403 " in str(e) or " 401 " in str(e)
+
+
+def char_contracts(char_id):
+    """The character's own contracts (issued, assigned to them or accepted).
+    ESI only keeps the last 30 days plus anything still open/in progress."""
+    if not _has_contracts_scope(char_id):
+        return {"needs_scope": True, "contracts": []}
+    tok = get_access_token(char_id)
+    cid = int(char_id)
+    try:
+        rows = esi_fetch_pages(f"/characters/{cid}/contracts/", tok, max_pages=10)
+    except RuntimeError as e:
+        if _scope_error(e):
+            return {"needs_scope": True, "contracts": []}
+        raise
+    names = esi_names([r.get(k) or 0 for r in rows for k in
+                       ("issuer_id", "assignee_id", "acceptor_id",
+                        "start_location_id", "end_location_id")])
+
+    def who(i):
+        return names.get(i, {}).get("name", "") if i else ""
+
+    def where(i):
+        if not i:
+            return ""
+        if i >= 10 ** 12:
+            return structure_name(i, tok)
+        return names.get(i, {}).get("name", str(i))
+
+    out = []
+    for r in rows:
+        role = ("issuer" if r.get("issuer_id") == cid else
+                "assignee" if r.get("assignee_id") == cid else "acceptor")
+        out.append({
+            "id": r["contract_id"], "type": r.get("type"), "status": r.get("status"),
+            "title": r.get("title") or "", "role": role,
+            "for_corp": bool(r.get("for_corporation")),
+            "availability": r.get("availability"),
+            "price": r.get("price") or 0, "reward": r.get("reward") or 0,
+            "collateral": r.get("collateral") or 0, "buyout": r.get("buyout") or 0,
+            "volume": r.get("volume") or 0, "days": r.get("days_to_complete") or 0,
+            "issued": r.get("date_issued"), "expires": r.get("date_expired"),
+            "accepted": r.get("date_accepted"), "completed": r.get("date_completed"),
+            "issuer": who(r.get("issuer_id")), "assignee": who(r.get("assignee_id")),
+            "acceptor": who(r.get("acceptor_id")),
+            "start": where(r.get("start_location_id")),
+            "end": where(r.get("end_location_id")),
+        })
+    out.sort(key=lambda x: x["issued"] or "", reverse=True)
+    return {"needs_scope": False, "contracts": out}
+
+
+def char_contract_items(char_id, contract_id, ctype):
+    """Items in one of the character's contracts, valued at EVE's average
+    price, plus the bids if it's an auction."""
+    tok = get_access_token(char_id)
+    cid = int(char_id)
+    rows, _ = esi_fetch(f"/characters/{cid}/contracts/{contract_id}/items/", tok)
+    missing = {r["type_id"] for r in rows if str(r["type_id"]) not in type_info}
+    if missing:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            list(pool.map(get_type_info, missing))
+        save_json(TYPES_PATH, type_info)
+    try:
+        avg = market_prices()
+    except RuntimeError:
+        avg = {}
+    items = []
+    for r in rows:
+        bpc = r.get("raw_quantity") == -2
+        unit = None if bpc else avg.get(r["type_id"])
+        items.append({
+            "type_id": r["type_id"], "qty": r.get("quantity", 1),
+            "name": type_info.get(str(r["type_id"]), {}).get("name", str(r["type_id"])),
+            "included": r.get("is_included", True), "bpc": bpc,
+            "value": unit * r.get("quantity", 1) if unit else None})
+    items.sort(key=lambda x: (not x["included"], -(x["value"] or 0)))
+    bids = []
+    if ctype == "auction":
+        try:
+            b, _ = esi_fetch(f"/characters/{cid}/contracts/{contract_id}/bids/", tok)
+            bids = sorted([{"amount": x.get("amount", 0), "date": x.get("date_bid")}
+                           for x in b], key=lambda x: -x["amount"])
+        except RuntimeError:
+            pass
+    return {"items": items, "bids": bids,
+            "value": sum(i["value"] or 0 for i in items if i["included"])}
 
 
 def parse_appraisal_lines(text):
@@ -2865,6 +2961,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, char_blueprints(char_id))
             elif sub == "jobs":
                 self._send(200, char_jobs(char_id))
+            elif sub == "contracts":
+                self._send(200, char_contracts(char_id))
+            elif sub == "contract" and len(parts) > 5 and parts[5].isdigit():
+                self._send(200, char_contract_items(
+                    char_id, int(parts[5]), q.get("type", [""])[0]))
             else:
                 self._send(404, {"error": "Unknown endpoint."})
 
@@ -5425,8 +5526,137 @@ function jumpToContracts(item){
   state._pendingContract=item;
   go("contracts");
 }
-async function rContracts(m){
-  m.innerHTML=`<div class="card"><h2>Contracts</h2>
+/* ---------------- Contracts: My contracts + Public search ---------------- */
+function rContracts(m){
+  if(state._pendingContract) state.ctSub="public";    // "find in contracts" from Item Search
+  const sub=state.ctSub||"mine";
+  m.innerHTML=`<div class="subtabs">${[["mine","My contracts"],["public","Public search"]].map(([k,l])=>
+    `<button class="${sub===k?"active":""}" onclick="state.ctSub='${k}';render()">${l}</button>`).join("")}</div>
+    <div id="ctBody"></div>`;
+  (sub==="mine"?rMyContracts:rContractsPublic)($("#ctBody"));
+}
+const MC_TYPE={item_exchange:"Item exchange",auction:"Auction",courier:"Courier",loan:"Loan",unknown:"Contract"};
+const MC_STATUS={outstanding:"Outstanding",in_progress:"In progress",finished:"Finished",
+  finished_issuer:"Finished",finished_contractor:"Finished",cancelled:"Cancelled",rejected:"Rejected",
+  failed:"Failed",deleted:"Deleted",reversed:"Reversed",expired:"Expired"};
+state.mc=state.mc||{}; state.mcOpen=state.mcOpen||{}; state.mcItems=state.mcItems||{};
+function mcChars(){
+  const cs=state.status.characters||[], sel=state.mcChar||"all";
+  return sel==="all"?cs:cs.filter(c=>String(c.character_id)===String(sel));
+}
+function rMyContracts(m){
+  const cs=state.status.characters||[], sel=state.mcChar||"all";
+  m.innerHTML=`<div class="card"><h2>My contracts</h2>
+    <div class="row"><select onchange="state.mcChar=this.value;render()">
+      <option value="all">All characters</option>${cs.map(c=>`<option value="${c.character_id}" ${
+        String(c.character_id)===String(sel)?"selected":""}>${esc(c.name)}</option>`).join("")}</select>
+      <button class="btn sec" onclick="mcLoad(true)">Refresh</button>
+      <span id="mcStat" class="dim" style="font-size:12.5px"></span></div>
+    <p class="muted-note">Contracts you issued, that were assigned to you, or that you accepted.
+    EVE keeps the last 30 days plus anything still open, and updates them about every 5 minutes.
+    Click a contract to see its items.</p>
+    <div id="mcOut"></div></div>`;
+  mcRender(); mcLoad(false);
+}
+async function mcLoad(force){
+  const todo=mcChars().filter(c=>force||!state.mc[c.character_id]||Date.now()-state.mc[c.character_id].t>120000);
+  if(!todo.length) return;
+  const st=$("#mcStat"); if(st) st.textContent="Loading…";
+  await Promise.all(todo.map(c=>api("/api/character/"+c.character_id+"/contracts")
+    .then(d=>{ state.mc[c.character_id]={t:Date.now(),...d}; })
+    .catch(e=>{ state.mc[c.character_id]={t:Date.now(),error:e.message,contracts:[]}; })));
+  const s2=$("#mcStat"); if(s2) s2.textContent="Updated "+new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+  mcRender();
+}
+function mcDate(s){ return s?new Date(s).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""; }
+function mcGroup(c){
+  const exp=c.status==="outstanding"&&c.expires&&new Date(c.expires)<Date.now();
+  if(c.status==="outstanding"&&!exp) return c.role==="issuer"?"out":"assigned";
+  if(c.status==="in_progress") return "progress";
+  return "done";
+}
+function mcPrice(c){
+  if(c.type==="courier") return `${isk(c.reward)}<div class="dim small">collateral ${isk(c.collateral)}</div>`;
+  if(c.type==="auction") return `${isk(c.price)}${c.buyout?`<div class="dim small">buyout ${isk(c.buyout)}</div>`:""}`;
+  if(c.reward&&!c.price) return `<span title="You pay this to whoever accepts">${isk(c.reward)}</span><div class="dim small">reward</div>`;
+  return isk(c.price)+(c.reward?`<div class="dim small">+ ${isk(c.reward)} reward</div>`:"");
+}
+function mcParty(c){
+  if(c.role==="issuer") return c.acceptor?`→ ${esc(c.acceptor)}`:c.assignee&&c.availability!=="public"?`for ${esc(c.assignee)}`:
+    `<span class="dim">${c.availability==="public"?"public":"—"}</span>`;
+  return `from ${esc(c.issuer)}`;
+}
+function mcWhen(c,g){
+  if(g==="out"||g==="assigned") return `<span title="${esc(mcDate(c.expires))}">expires in ${until(c.expires)}</span>`;
+  if(g==="progress"&&c.accepted&&c.days){
+    const due=new Date(new Date(c.accepted).getTime()+c.days*86400000);
+    return `due in ${until(due.toISOString())}`; }
+  const st=c.status==="outstanding"?"expired":c.status;
+  return `<span class="${/^finished/.test(st)?"good":"dim"}">${MC_STATUS[st]||st}</span>
+    <div class="dim small">${mcDate(c.completed||c.expires)}</div>`;
+}
+function mcRender(){
+  const el=$("#mcOut"); if(!el) return;
+  const chars=mcChars(), multi=chars.length>1;
+  const notes=[]; const seen=new Set(); const rows=[];
+  chars.forEach(ch=>{
+    const d=state.mc[ch.character_id]; if(!d) return;
+    if(d.needs_scope) notes.push(`<b>${esc(ch.name)}</b> needs the contracts permission — see
+      <a href="#" onclick="openSettings();return false">Setup &amp; permissions</a>, then re-add the character.`);
+    if(d.error) notes.push(`<b>${esc(ch.name)}</b>: <span class="bad">${esc(d.error)}</span>`);
+    (d.contracts||[]).forEach(c=>{ if(seen.has(c.id)) return; seen.add(c.id); rows.push({...c,cid:ch.character_id,cname:ch.name}); });
+  });
+  if(!chars.some(ch=>state.mc[ch.character_id])){ el.innerHTML=`<p class="dim">Loading…</p>`; return; }
+  const groups=[["out","Outstanding","your contracts waiting for someone to accept them"],
+    ["assigned","Assigned to me","private contracts waiting for you to accept them"],
+    ["progress","In progress","couriers on their way"],
+    ["done","Finished / expired","last 30 days"]];
+  el.innerHTML=(notes.length?`<div class="muted-note" style="margin:0 0 10px">${notes.join("<br>")}</div>`:"")+
+    groups.map(([g,label,sub])=>{
+      const list=rows.filter(c=>mcGroup(c)===g);
+      if(!list.length&&g!=="out") return "";
+      return `<h3 style="margin:16px 0 6px">${label} <span class="dim" style="font-weight:400;font-size:12.5px">(${list.length}) · ${sub}</span></h3>${
+        list.length?`<table><tr>${multi?"<th>Character</th>":""}<th>Contract</th><th>Type</th><th class="num">Price</th>
+          <th>Location</th><th>Other party</th><th>${g==="done"?"Result":"Time"}</th></tr>${
+        list.map(c=>{ const open=state.mcOpen[c.id];
+          return `<tr style="cursor:pointer" onclick="mcToggle(${c.id},'${c.cid}','${c.type}')">
+            ${multi?`<td>${esc(c.cname)}</td>`:""}
+            <td>${open?"▾":"▸"} ${esc(c.title||MC_TYPE[c.type]||"Contract")}${c.for_corp?` <span class="pill">corp</span>`:""}</td>
+            <td>${MC_TYPE[c.type]||esc(c.type)}</td><td class="num">${mcPrice(c)}</td>
+            <td>${esc(c.start)}${c.type==="courier"&&c.end?`<div class="dim small">→ ${esc(c.end)}</div>`:""}</td>
+            <td>${mcParty(c)}</td><td>${mcWhen(c,g)}</td></tr>${
+            open?`<tr><td colspan="${multi?7:6}" style="background:var(--panel2)">${mcItemsHtml(c)}</td></tr>`:""}`;}).join("")}</table>`
+        :`<p class="dim">None right now.</p>`}`;}).join("");
+}
+function mcItemsHtml(c){
+  const it=state.mcItems[c.id];
+  if(!it) return `<span class="dim">Loading items…</span>`;
+  if(it.error) return `<span class="bad">${esc(it.error)}</span>`;
+  const inc=it.items.filter(x=>x.included), want=it.items.filter(x=>!x.included);
+  const line=x=>`<div>${num(x.qty)} × ${esc(x.name)}${x.bpc?` <span class="pill">copy</span>`:""}
+    <span class="dim">${x.value?" · ≈ "+isk(x.value):""}</span></div>`;
+  let cmp="";
+  if(it.value&&c.type==="item_exchange"&&c.price&&!want.length){
+    const pct=Math.round((c.price-it.value)/it.value*100);
+    cmp=` · priced <b class="${pct<0?"warn":"good"}">${Math.abs(pct)}% ${pct<0?"under":"over"}</b> the estimate`;
+  }
+  return `${inc.length?`<b>Items${c.type==="courier"?" to deliver":""}</b>${inc.map(line).join("")}`:""}
+    ${want.length?`<div style="margin-top:6px"><b>Asking for</b>${want.map(line).join("")}</div>`:""}
+    ${!inc.length&&!want.length?`<span class="dim">No items.</span>`:""}
+    ${it.value?`<div class="dim small" style="margin-top:6px">Estimated value ≈ ${isk(it.value)} (EVE's average market price)${cmp}</div>`:""}
+    ${it.bids.length?`<div style="margin-top:6px"><b>Bids (${it.bids.length})</b>${it.bids.slice(0,10).map(b=>
+      `<div>${isk(b.amount)} <span class="dim">${mcDate(b.date)}</span></div>`).join("")}</div>`:
+      c.type==="auction"?`<div class="dim small" style="margin-top:6px">No bids yet.</div>`:""}`;
+}
+async function mcToggle(id,cid,type){
+  state.mcOpen[id]=!state.mcOpen[id]; mcRender();
+  if(!state.mcOpen[id]||state.mcItems[id]) return;
+  try{ state.mcItems[id]=await api("/api/character/"+cid+"/contract/"+id+"?type="+encodeURIComponent(type)); }
+  catch(e){ state.mcItems[id]={error:e.message}; }
+  mcRender();
+}
+async function rContractsPublic(m){
+  m.innerHTML=`<div class="card"><h2>Public contracts</h2>
     <div class="row">
       <span class="dim">Region:</span>
       <select id="ctRegion" onchange="ctRegionChanged()"></select>

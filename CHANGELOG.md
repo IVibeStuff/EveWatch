@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.0
+- Contracts tab: new "My contracts" sub-tab (the public contract search moves to "Public search"). Shows your own contracts for one or all characters, grouped as Outstanding, Assigned to me, In progress (couriers) and Finished / expired (last 30 days), with price, location, the other party and time left. Click a contract for its items, an estimated value (EVE's average market price, with how your asking price compares) and auction bids.
+- Uses the optional contracts permission (Setup & permissions); characters without it get a short note.
+
 ## 1.8.0
 - New Accomplishments tab for the active character: skill-point and skill tiles, milestone medals (SP, skills at V, Elite certificates, Mastery V ships, battleship / Tech II / Tech III / capital pilot), "Next up" (the closest next certificate levels and ship masteries, with training time and + Plan), every certificate (Basic → Elite) grouped by area with what the next level needs, and ship masteries by ship class. Worked out from your skills and CCP's data — no new permissions.
 - Help is now a "Help & settings" window with three sections: About & updates, General (Start with Windows / at login, Close on Exit, Setup & permissions, ship mastery data, data folder) and Notifications.

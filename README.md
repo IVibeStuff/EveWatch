@@ -82,6 +82,9 @@ press Ctrl+C in it) to stop.
   system name, e.g. "Rens"), then compare any item's buy/sell prices across
   all of them, with a price chart. Jita 4-4 is included by default.
 
+- **Contracts → My contracts** — your own outstanding, assigned, in-progress
+  and recently finished contracts (needs the optional contracts permission),
+  with each contract's items, estimated value and auction bids.
 - **Item Search / Contracts** — find any item, jump to its market prices or
   to public contracts containing it (the Contracts tab builds a local index
   per region; the first build takes a while and can be resumed).
