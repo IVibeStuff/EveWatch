@@ -53,8 +53,10 @@ EveWatch's Characters tab walks you through this (Setup section), but in short:
    - `esi-characters.read_blueprints.v1` (Industry tab)
    - `esi-industry.read_character_jobs.v1` (Industry tab)
 
-   If you add scopes later, also re-add each character with
-   **+ Add character** so their login includes the new permissions.
+   If you add scopes later, use **⚙ → Update permissions…** on each
+   character so their login includes them. If EVE answers "invalid_scope"
+   (portal changes take a few minutes to reach EVE's login), press Back on
+   EveWatch's login step and add the character without that permission.
 6. Callback URL — paste exactly: `http://localhost:8635/callback`
 7. Save, copy the **Client ID**, paste it into the Setup section of EveWatch's Characters tab, click
    **Save**.
@@ -94,7 +96,7 @@ press Ctrl+C in it) to stop.
   `esi-characters.read_loyalty.v1` (loyalty points) and
   `esi-characters.read_agents_research.v1` (research points)
   added in the developer portal, switched on under Help & settings → General → Setup &
-  permissions, then characters re-added.
+  permissions, then ⚙ → Update permissions on each character.
 - **Appraisal** processes big lists in batches and shows results as it goes.
 - **Accomplishments** — certificates (Basic → Elite) and ship masteries
   worked out from your skills, milestone medals, and the closest next
@@ -104,7 +106,7 @@ press Ctrl+C in it) to stop.
   of yours is completed, or an industry job finishes. Pick which ones you want
   and how often EVE's API is checked (default once an hour). The contract
   notice needs the optional `esi-contracts.read_character_contracts.v1`
-  permission (portal → Setup & permissions → re-add characters). Notices only
+  permission (portal → Setup & permissions → ⚙ Update permissions). Notices only
   arrive while EveWatch is running.
 
 ## Good to know

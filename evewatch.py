@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8635
 APP_NAME = "EveWatch"
-APP_VERSION = "1.9.0"
+APP_VERSION = "2.0.0"
 # Filled in automatically when the installers are built on GitHub; when running
 # from source you can set "update_repo": "user/repo" in config.json instead.
 GITHUB_REPO = "@@GITHUB_REPO@@"
@@ -343,16 +343,24 @@ def esi_names(ids):
 # SSO / OAuth2 with PKCE
 # ----------------------------------------------------------------------------
 
-def sso_login_url():
+SCOPE_LABELS = {EXTRA_SCOPES[0]: "Loyalty points", RESEARCH_SCOPE: "Research points",
+                CONTRACTS_SCOPE: "Contracts"}
+login_dropped = {}                 # login state -> optional scopes left out of that login
+
+
+
+
+def sso_login_url(scopes=None, dropped=None):
     verifier = b64url(secrets.token_bytes(32))
     challenge = b64url(hashlib.sha256(verifier.encode()).digest())
     state = b64url(secrets.token_bytes(16))
     pkce_states[state] = verifier
+    login_dropped[state] = list(dropped or [])
     q = urllib.parse.urlencode({
         "response_type": "code",
         "redirect_uri": CALLBACK_URL,
         "client_id": config["client_id"],
-        "scope": " ".join(active_scopes()),
+        "scope": " ".join(scopes or active_scopes()),
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
@@ -377,6 +385,7 @@ def jwt_payload(token):
 
 def handle_callback(code, state):
     verifier = pkce_states.pop(state, None)
+    dropped = login_dropped.pop(state, [])
     if not verifier:
         raise RuntimeError("Unknown login state - please try again.")
     tok = sso_token_request({
@@ -394,11 +403,12 @@ def handle_callback(code, state):
         "added": int(time.time()),
         "scopes": ([payload["scp"]] if isinstance(payload.get("scp"), str)
                    else list(payload.get("scp") or [])),
+        "pending_scopes": dropped,       # optional scopes left out of this login
     }
     access_cache[char_id] = (tok["access_token"],
                              time.time() + tok.get("expires_in", 1000) - 60)
     save_json(TOKENS_PATH, tokens)
-    return tokens[char_id]["name"]
+    return tokens[char_id]["name"], dropped
 
 
 def get_access_token(char_id):
@@ -1256,6 +1266,25 @@ def notify_status():
         "feed": notif_feed[-30:][::-1],
         "latest": notif_feed[-1]["id"] if notif_feed else 0,
     }
+
+
+def char_permissions(rec):
+    """Optional permissions switched on in Setup that this character's login
+    doesn't include: skipped (left out at login, e.g. EVE didn't accept it
+    yet) or missing (added before it was switched on)."""
+    have = rec.get("scopes")
+    out = []
+    for sc in active_scopes():
+        if sc in SCOPES:
+            continue
+        if sc in (rec.get("pending_scopes") or []):
+            st = "skipped"
+        elif have is not None and sc not in have:
+            st = "missing"
+        else:
+            continue
+        out.append({"scope": sc, "label": SCOPE_LABELS.get(sc, sc), "state": st})
+    return out
 
 
 _prices_cache = {"ts": 0, "data": {}}
@@ -2881,11 +2910,26 @@ class Handler(BaseHTTPRequestHandler):
             if not config.get("client_id"):
                 self._send(400, {"error": "Set your Client ID first."})
             else:
-                self._redirect(sso_login_url())
+                opt = [sc for sc in active_scopes() if sc not in SCOPES]
+                if "go" in q or not opt:
+                    want = q.get("skip", [""])[0]
+                    skip = opt if want == "all" else [x for x in want.split(",") if x in opt]
+                    self._redirect(sso_login_url(
+                        [sc for sc in active_scopes() if sc not in skip], skip))
+                else:
+                    self._send(200, login_page(opt).encode(), "text/html")
 
         elif p == "/callback" and method == "GET":
-            name = handle_callback(q["code"][0], q["state"][0])
-            self._send(200, CALLBACK_PAGE.replace("{NAME}", name).encode(),
+            name, dropped = handle_callback(q["code"][0], q["state"][0])
+            note = ""
+            if dropped:
+                note = ("<p style='color:#e0b455;max-width:560px;margin:16px auto'>Added without the "
+                        + ", ".join(SCOPE_LABELS.get(x, x) for x in dropped)
+                        + " permission. Once your developer application lists it, use "
+                        "⚙ → Update permissions on the Characters screen.</p>")
+            self._send(200, CALLBACK_PAGE.replace("{NAME}", name)
+                       .replace("{NOTE}", note)
+                       .replace("{WAIT}", "6000" if dropped else "1500").encode(),
                        "text/html")
 
         elif p == "/api/status" and method == "GET":
@@ -2905,7 +2949,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scope_contracts": bool(config.get("scope_contracts")),
                 "contracts_scope": CONTRACTS_SCOPE,
                 "characters": [{"character_id": r["character_id"],
-                                "name": r["name"]} for r in tokens.values()],
+                                "name": r["name"],
+                                "perm": char_permissions(r)} for r in tokens.values()],
                 "catalog": ({"state": "done",
                              "skills": len(catalog["skills"])}
                             if catalog else dict(catalog_status)),
@@ -3240,8 +3285,49 @@ class Handler(BaseHTTPRequestHandler):
 
 CALLBACK_PAGE = """<!doctype html><html><body style="background:#0b0e14;
 color:#c8d3e0;font-family:sans-serif;text-align:center;padding-top:80px">
-<h2>{NAME} added ✔</h2><p>You can close this tab and return to EveWatch.</p>
-<script>setTimeout(()=>location.href='/',1500)</script></body></html>"""
+<h2>{NAME} added ✔</h2>{NOTE}<p>You can close this tab and return to EveWatch.</p>
+<script>setTimeout(()=>location.href='/',{WAIT})</script></body></html>"""
+
+def login_page(opt):
+    """EveWatch's step before EVE's login. EVE answers a permission that the
+    developer application doesn't list (yet) with its own "invalid_scope"
+    page, which EveWatch can't see - so this page offers the way out."""
+    lab = lambda sc: SCOPE_LABELS.get(sc, sc)          # noqa: E731
+    skips = "".join(
+        f'<a class="b2" href="/login?go=1&skip={urllib.parse.quote(sc)}" onclick="done()">'
+        f'Log in without {lab(sc)}</a>' for sc in opt)
+    return LOGIN_PAGE.replace("{OPT}", ", ".join(lab(sc) for sc in opt)) \
+                     .replace("{SKIPS}", skips)
+
+
+LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>EveWatch - log in</title>
+<style>body{background:#0b0e14;color:#c8d3e0;font-family:"Segoe UI",system-ui,sans-serif;
+text-align:center;padding:70px 16px} .box{max-width:620px;margin:0 auto}
+a.b{display:inline-block;background:#58a6ff;color:#08131f;padding:10px 18px;border-radius:7px;
+font-weight:600;text-decoration:none;margin:8px} a.b2{display:inline-block;background:#0e1420;
+color:#c8d3e0;border:1px solid #263349;padding:7px 13px;border-radius:7px;text-decoration:none;
+margin:4px} a{color:#58a6ff} code{background:#0e1420;padding:2px 6px;border-radius:4px}
+#fb{margin-top:34px;padding:14px 18px;border:1px solid #263349;border-radius:9px;
+font-size:14px;line-height:1.5} #fb.back{border-color:#e0b455;box-shadow:0 0 0 1px #e0b455}
+#fb h3{margin:0 0 6px;font-size:15px;color:#e0b455}</style></head><body><div class="box">
+<h2>Log in with EVE</h2>
+<p>EveWatch asks for the standard permissions plus the optional ones you switched on:
+<b>{OPT}</b>.</p>
+<a class="b" href="/login?go=1" onclick="sessionStorage.setItem('evwLogin','1')">Continue to EVE's login</a>
+<div id="fb"><h3 id="fbh">If EVE answers with "invalid_scope"</h3>
+That means your developer application at developers.eveonline.com doesn't list that
+permission yet (or the change hasn't reached EVE's login - that can take a few minutes).
+Press your browser's <b>Back</b> button to return here and add the character without it:
+<div style="margin-top:10px">{SKIPS}
+<a class="b2" href="/login?go=1&skip=all" onclick="done()">Standard permissions only</a></div>
+<div style="margin-top:8px;color:#7a8aa0;font-size:13px">You can add it later with
+⚙ → Update permissions on the Characters screen.</div></div>
+<p style="margin-top:22px"><a href="/">Cancel</a></p></div>
+<script>function done(){try{sessionStorage.removeItem('evwLogin')}catch(e){}}
+window.addEventListener('pageshow',()=>{let b=null;try{b=sessionStorage.getItem('evwLogin')}catch(e){}
+if(b){document.getElementById('fb').className='back';
+document.getElementById('fbh').textContent='Back from EVE without finishing the login? If it said "invalid_scope":';}});
+</script></body></html>"""
 
 
 PAGE = r"""<!doctype html>
@@ -3323,7 +3409,7 @@ header{display:flex;align-items:center;gap:16px;padding:10px 20px;
   box-shadow:var(--shadow)}
 header h1{font-size:18px;margin:0;color:var(--gold);letter-spacing:2px}
 nav{display:flex;gap:4px;flex-wrap:wrap}
-nav button{background:none;border:none;color:var(--dim);padding:8px 14px;
+nav button{background:none;border:none;color:var(--dim);padding:8px 11px;white-space:nowrap;
   cursor:pointer;font-size:14px;border-radius:var(--radius-sm)}
 nav button.active{color:var(--txt);background:var(--panel2);
   outline:1px solid var(--line)}
@@ -3449,6 +3535,8 @@ nav button.locked{opacity:.38;cursor:not-allowed}
 .cs-pop .sw{display:flex;gap:6px;margin-bottom:8px}
 .cs-pop .sw button{margin:0}
 .cs-pop .sw button.on{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
+.cs-perm{font-size:12px;color:var(--warn);padding:6px 10px 2px;line-height:1.4}
+.cs-perm a{color:var(--acc)}
 .cs-foot{text-align:center;margin-top:28px;color:var(--dim);font-size:12.5px}
 /* Accomplishments: certificate / mastery level colours (I..V) */
 body{--l1:#8592a6;--l2:#3fb27f;--l3:#4a90e2;--l4:#a274f0;--l5:#e0b455}
@@ -3609,7 +3697,7 @@ th.sortable:hover{color:var(--acc)}
   <nav id="nav"></nav>
   <div style="flex:1"></div>
   <div id="activeChar" class="hchar"></div>
-  <button class="btn sec" id="helpBtn" onclick="openHelp()">Help &amp; settings
+  <button class="btn sec" id="helpBtn" style="white-space:nowrap" onclick="openHelp()">Help &amp; settings
     <span id="updDot" style="display:none;color:var(--gold)">●</span></button>
 </header>
 <div id="helpModal" class="hm-bg" onclick="closeHelp()"></div>
@@ -3987,6 +4075,7 @@ function csPop(c){
       THEMES.map(([id,nm])=>`<option value="${id}" ${th.style===id?"selected":""}>${nm}</option>`).join("")}</select>
     <div class="sw"><button class="${th.mode==="dark"?"on":""}" onclick="setCharTheme(${c.character_id},null,'dark')">☾ Dark</button>
       <button class="${th.mode==="light"?"on":""}" onclick="setCharTheme(${c.character_id},null,'light')">☀ Light</button></div>
+    <button onclick="location.href='/login'" title="Log in again with EVE to add newly enabled permissions">Update permissions…</button>
     <button class="danger" onclick="removeChar(${c.character_id})">Remove character</button></div>`;
 }
 function csCard(c){
@@ -4005,7 +4094,7 @@ function csCard(c){
     kv=`<div class="cs-kv"><div><span class="dim">Skill points</span><span>${num(d.total_sp)}</span></div>
       <div><span class="dim">Wallet</span><span>${isk(d.wallet)}</span></div></div>`;
   }
-  let ship=`<div class="cs-ship dim">${k?"Ship and location need the location permissions — re-add this character if you added it early.":"…"}</div>`,
+  let ship=`<div class="cs-ship dim">${k?"Ship and location need the location permissions — use ⚙ → Update permissions if you added this character early.":"…"}</div>`,
       loc="";
   if(k&&k.available){
     ship=`<div class="cs-ship"><img src="https://images.evetech.net/types/${k.ship_type_id}/render?size=128" alt="">${
@@ -4020,7 +4109,14 @@ function csCard(c){
         state.popFor===cid?"null":cid};render()">⚙</button></div>${csPop(c)}
     <div class="cs-card" onclick="enterChar(${cid})">
       <div class="cs-portrait"><img src="https://images.evetech.net/characters/${cid}/portrait?size=512" alt=""></div>
-      ${train}${kv}${ship}${loc}</div></div>`;
+      ${train}${kv}${ship}${loc}${permNote(c)}</div></div>`;
+}
+function permNote(c){
+  const ps=c.perm||[]; if(!ps.length) return "";
+  const names=ps.map(p=>esc(p.label)).join(", ");
+  return `<div class="cs-perm" onclick="event.stopPropagation()"
+    title="Switched on in Setup but not part of this character's login. Once your developer application lists it (portal changes can take a few minutes), log in again.">${
+    names} permission not on this login — <a href="/login">update</a></div>`;
 }
 /* Hidden tab, opened from Help: connection setup + optional loyalty points */
 function openSettings(){
@@ -4161,7 +4257,8 @@ function setupHtml(open){
     <p class="muted-note">Order matters: first tick them on your developer
     application at developers.eveonline.com (under esi-characters / esi-contracts), then switch
     this on, then add each character again with the + slot above. If you switch
-    it on before the portal is updated, EVE's login will reject the request.</p>
+    it on before the portal is updated, EVE's login will reject the request
+    ("invalid_scope"). Portal changes can take several minutes to reach EVE's login.</p>
     <label style="display:block"><input type="checkbox" id="extrasBox"
       ${st.scope_extras?"checked":""} onchange="saveExtras()">
       Request the loyalty-points permission when logging in</label>
@@ -4180,7 +4277,7 @@ async function saveExtras(){
     body:JSON.stringify({scope_extras:on,scope_research:rs,scope_contracts:ct})});
   state.status.scope_extras=on; state.status.scope_research=rs; state.status.scope_contracts=ct;
   if(help.notif) help.notif.contracts_scope=ct;
-  toast(on||rs||ct?"Saved — enable the permissions in the developer portal first, then re-add your characters."
+  toast(on||rs||ct?"Saved — enable the permissions in the developer portal first, then use ⚙ → Update permissions on each character."
           :"Off — logins will use the standard permissions only.");
 }
 async function saveCid(){
@@ -4845,8 +4942,8 @@ function rWallet(m){
       <button class="btn sec" onclick="loadLP()">Load loyalty points</button>
     </div>
     <p class="muted-note">Needs the optional loyalty-points scope — switch it on
-    under Help → Setup &amp; loyalty points (and enable them on your developer application first), then
-    re-add your characters. Each time you load these, EveWatch records a
+    under Help &amp; settings → Setup &amp; permissions (and enable them on your developer application first), then
+    use ⚙ → Update permissions on your characters. Each time you load these, EveWatch records a
     snapshot, so changes since your first load are shown as trends.</p>
     <div id="lpOut"></div><div id="stOut"></div></div>`;
   if(state._journal){ fillWalletTypes(); renderWallet(); }
@@ -5007,7 +5104,7 @@ async function loadLP(){
 }
 function scopeHint(e){
   toast(/403|scope|token/i.test(e.message)
-    ?"This needs the optional loyalty-points scope — enable them under Help → Setup & loyalty points and re-add the character."
+    ?"This needs the optional loyalty-points permission — switch it on under Help & settings → General → Setup & permissions, then use ⚙ → Update permissions on the character."
     :e.message);
 }
 async function loadStandings(){
@@ -5238,7 +5335,7 @@ function rLPStore(m){
     ISK fee − the cost of any required items) ÷ LP cost, using live Jita 4-4
     prices. Prices load a few items at a time, so a big store takes a minute or
     two; results fill in as they arrive. Loading your corporations needs the
-    loyalty-points scope (Help → Setup & loyalty points); searching by name doesn't.</p>
+    loyalty-points permission (Help &amp; settings → Setup &amp; permissions); searching by name doesn't.</p>
     <div id="lpStatus"></div>
     <div id="lpControls"></div>
     <div id="lpOut"></div></div>
@@ -5255,7 +5352,7 @@ function rLPStore(m){
     agent plus a ${num(RP.iskEach)} ISK fee, and is always the datacore of the research skill
     you chose with the agent. Current RP = the agent's banked remainder plus points per day
     since you started. Prices come from every market location on the Market tab. Needs the
-    research-points permission (Help → Setup &amp; loyalty points).</p>
+    research-points permission (Help &amp; settings → Setup &amp; permissions).</p>
     <div id="rpOut"></div></div>`;
   lpFillCorps();
   if(LP.offers.length){ lpControls(); lpRender(); }
@@ -5266,7 +5363,7 @@ async function rpLoad(){
   let r;
   try{ r=await api("/api/character/"+cid+"/research"); }
   catch(e){ $("#rpStatus").innerHTML=`<span class="bad">${esc(e.message)}</span>`;
-    toast("Research points: "+e.message+" (needs the research-points permission — Help → Setup & loyalty points)");
+    toast("Research points: "+e.message+" (needs the research-points permission — Help & settings → Setup & permissions)");
     return; }
   RP.agents=r.agents; RP.rpEach=r.rp_per_datacore; RP.iskEach=r.isk_per_datacore;
   if(!r.agents.length){ $("#rpStatus").textContent="This character has no research agents."; return; }
@@ -5333,7 +5430,7 @@ async function lpLoadMine(){
     if(!LP.corpList.length) toast("No loyalty points on that character.");
     lpFillCorps();
   }catch(e){ toast("Loyalty points: "+e.message+
-    " (needs the loyalty-points scope — Help → Setup & loyalty points)"); }
+    " (needs the loyalty-points permission — Help & settings → Setup & permissions)"); }
 }
 async function lpSearchCorp(){
   const q=$("#lpCorpQ").value.trim(); if(!q) return;
@@ -5602,7 +5699,7 @@ function mcRender(){
   chars.forEach(ch=>{
     const d=state.mc[ch.character_id]; if(!d) return;
     if(d.needs_scope) notes.push(`<b>${esc(ch.name)}</b> needs the contracts permission — see
-      <a href="#" onclick="openSettings();return false">Setup &amp; permissions</a>, then re-add the character.`);
+      <a href="#" onclick="openSettings();return false">Setup &amp; permissions</a>, then ⚙ → Update permissions on the Characters screen.`);
     if(d.error) notes.push(`<b>${esc(ch.name)}</b>: <span class="bad">${esc(d.error)}</span>`);
     (d.contracts||[]).forEach(c=>{ if(seen.has(c.id)) return; seen.add(c.id); rows.push({...c,cid:ch.character_id,cname:ch.name}); });
   });
@@ -7206,7 +7303,7 @@ function rIndustry(m){
       oninput="renderBlueprints()"></div>
     <p class="muted-note">Needs the blueprint and industry scopes — if you
     added this character before those existed, update the scopes in your
-    developer application and use “+ Add character” to log them in again.</p>
+    developer application and use ⚙ → Update permissions on the Characters screen.</p>
     <div id="jobsOut"></div>
     <div id="bpOut"></div></div>`;
 }
@@ -7234,7 +7331,7 @@ async function loadIndustry(){
   }catch(e){
     $("#jobsOut").innerHTML="";
     toast(e.message.includes("403")||e.message.includes("token")
-      ?"This character needs to be re-added with the new scopes (see note)."
+      ?"This character needs ⚙ → Update permissions on the Characters screen (see note)."
       :e.message);
   }
 }

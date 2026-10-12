@@ -1,18 +1,19 @@
 # Changelog
 
-## 1.9.0
-- Contracts tab: new "My contracts" sub-tab (the public contract search moves to "Public search"). Shows your own contracts for one or all characters, grouped as Outstanding, Assigned to me, In progress (couriers) and Finished / expired (last 30 days), with price, location, the other party and time left. Click a contract for its items, an estimated value (EVE's average market price, with how your asking price compares) and auction bids.
-- Uses the optional contracts permission (Setup & permissions); characters without it get a short note.
+## 2.0.0
+**New**
+- **Accomplishments tab** for the active character: skill-point and skill tiles, milestone medals (SP, skills at V, Elite certificates, Mastery V ships, battleship / Tech II / Tech III / capital pilot), "Next up" (the closest next certificate levels and ship masteries, with training time and + Plan), every certificate (Basic → Elite) grouped by area with what the next level needs, and ship masteries by ship class. Worked out from your skills and CCP's data — no new permissions.
+- **My contracts** (Contracts tab; the public contract search moves to "Public search"): your own contracts for one or all characters, grouped as Outstanding, Assigned to me, In progress (couriers) and Finished / expired (last 30 days), with price, location, the other party and time left. Click a contract for its items, an estimated value (EVE's average market price, with how your asking price compares) and auction bids.
+- **Notifications**: EveWatch watches your characters in the background and tells you when a skill finishes, the skill queue runs low or empty (threshold in hours), an item sells on the market, one of your contracts is completed, or an industry job finishes — each can be switched on or off. EVE's API is checked once an hour by default (15 min to 4 hours, or "Check now"); skill and industry timers are watched in between without extra API calls. Notices appear as desktop pop-ups (tray notification on Windows, notify-send on Linux) and in an open EveWatch tab; a gold dot on Help & settings marks unread ones.
+- **Help & settings** window replaces the Help menu: About & updates, General (Start with Windows / at login, Close on Exit, Setup & permissions, ship mastery data, data folder) and Notifications.
+- **Optional contracts permission** (`esi-contracts.read_character_contracts.v1`) for My contracts and the contract notice, alongside the loyalty- and research-points permissions in Setup & permissions.
+- **Safer logins**: when optional permissions are switched on, adding a character first shows an EveWatch "Log in with EVE" step. If EVE answers "invalid_scope" (the developer application doesn't list a permission yet — portal changes can take a few minutes), press Back and add the character without that permission, or with the standard permissions only.
+- Characters show which optional permissions are switched on but not part of their login; **⚙ → Update permissions…** logs a character in again to add them.
+- Skill plans are named after what you add ("Ishtar · Mastery IV", "Armor Tanking · Elite", "Fly Drake", "Drones V"); the name shows above the plan and is suggested when saving.
 
-## 1.8.0
-- New Accomplishments tab for the active character: skill-point and skill tiles, milestone medals (SP, skills at V, Elite certificates, Mastery V ships, battleship / Tech II / Tech III / capital pilot), "Next up" (the closest next certificate levels and ship masteries, with training time and + Plan), every certificate (Basic → Elite) grouped by area with what the next level needs, and ship masteries by ship class. Worked out from your skills and CCP's data — no new permissions.
-- Help is now a "Help & settings" window with three sections: About & updates, General (Start with Windows / at login, Close on Exit, Setup & permissions, ship mastery data, data folder) and Notifications.
-- Notifications: EveWatch can watch your characters in the background and tell you when a skill finishes, the skill queue runs low or empty (threshold in hours), an item sells on the market, one of your contracts is completed, or an industry job finishes. Each can be switched on or off.
-- Checks EVE's API once an hour by default (15 min to 4 hours, or "Check now"); skill and industry timers are watched in between without extra API calls.
-- Notices appear as desktop pop-ups (tray notification on Windows, notify-send on Linux) and in an open EveWatch tab; a gold dot on Help & settings marks unread ones.
-- Skill plans are named after what you add ("Ishtar · Mastery IV", "Armor Tanking · Elite", "Fly Drake", "Drones V"); the name shows above the plan and is suggested when saving. Fixed "undefined" in the Accomplishments + Plan message.
-- Fixed: skills that finished while you were offline now show as trained (and leave the queue) right away; EVE's API only records them after the character next logs in.
-- New optional contracts permission (esi-contracts.read_character_contracts.v1) for the "contract completed" notice: enable it on the developer portal, switch it on in Setup & permissions, then re-add your characters.
+**Fixed**
+- Skills that finished while you were offline now show as trained (and leave the queue) right away; EVE's API only records them after the character next logs in.
+- Header tabs stay on one line with the new Accomplishments tab.
 
 ## 1.7.0
 - Help → "Start with Windows" ("Start at login" on Linux): toggle auto-start any time, not only during installation.
