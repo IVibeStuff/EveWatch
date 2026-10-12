@@ -42,3 +42,12 @@ Filename: "{app}\EveWatch.exe"; Description: "Start EveWatch now"; Flags: nowait
 
 ; Your data (logins, plans, caches) lives in %LOCALAPPDATA%\EveWatch and is
 ; deliberately NOT removed on uninstall.
+
+[Code]
+{ "Start with Windows" can also be switched on in the app (Help menu); that
+  writes this Run value, so remove it on uninstall. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'EveWatch');
+end;

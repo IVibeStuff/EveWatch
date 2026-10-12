@@ -14,7 +14,7 @@ beyond Python itself.
 `EveWatch-Setup-x.y.z.exe` (Windows, no admin needed) or extract the `.tar.gz`
 and run `./install.sh` (Linux). EveWatch then runs from the notification area
 (tray) and opens in your browser; right-click the tray icon for *Open / Check
-for updates / Quit*. **Help > Check for updates** inside the page tells you
+for updates / Quit*. **Help & settings → About & updates** inside the page tells you
 when a new version is out. Your data is kept in `%LOCALAPPDATA%\EveWatch`
 (Windows) or `~/.local/share/EveWatch` (Linux) and survives updates.
 
@@ -90,9 +90,19 @@ press Ctrl+C in it) to stop.
   accumulates over time. Optional loyalty-point tracking needs
   `esi-characters.read_loyalty.v1` (loyalty points) and
   `esi-characters.read_agents_research.v1` (research points)
-  added in the developer portal, switched on under Help → Setup & loyalty points, then characters
-  re-added.
+  added in the developer portal, switched on under Help & settings → General → Setup &
+  permissions, then characters re-added.
 - **Appraisal** processes big lists in batches and shows results as it goes.
+- **Accomplishments** — certificates (Basic → Elite) and ship masteries
+  worked out from your skills, milestone medals, and the closest next
+  unlocks with a one-click "+ Plan".
+- **Notifications** (Help & settings → Notifications) — EveWatch tells you when
+  a skill finishes, a skill queue runs low or empty, an item sells, a contract
+  of yours is completed, or an industry job finishes. Pick which ones you want
+  and how often EVE's API is checked (default once an hour). The contract
+  notice needs the optional `esi-contracts.read_character_contracts.v1`
+  permission (portal → Setup & permissions → re-add characters). Notices only
+  arrive while EveWatch is running.
 
 ## Good to know
 - Your Client ID, character tokens, plans, and caches live in the

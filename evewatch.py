@@ -10,6 +10,7 @@ Run it, then open http://localhost:8635 in your browser.
 """
 
 import base64
+import calendar
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8635
 APP_NAME = "EveWatch"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.8.0"
 # Filled in automatically when the installers are built on GitHub; when running
 # from source you can set "update_repo": "user/repo" in config.json instead.
 GITHUB_REPO = "@@GITHUB_REPO@@"
@@ -104,6 +105,7 @@ EXTRA_SCOPES = [
 
 
 RESEARCH_SCOPE = "esi-characters.read_agents_research.v1"
+CONTRACTS_SCOPE = "esi-contracts.read_character_contracts.v1"
 # game rules for converting research points into datacores
 RP_PER_DATACORE = 100
 ISK_PER_DATACORE = 10000
@@ -115,6 +117,8 @@ def active_scopes():
         sc += EXTRA_SCOPES
     if config.get("scope_research"):
         sc.append(RESEARCH_SCOPE)
+    if config.get("scope_contracts"):
+        sc.append(CONTRACTS_SCOPE)
     return sc
 
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (personal local tool)"
@@ -388,6 +392,8 @@ def handle_callback(code, state):
         "name": payload.get("name", "Unknown"),
         "refresh_token": tok["refresh_token"],
         "added": int(time.time()),
+        "scopes": ([payload["scp"]] if isinstance(payload.get("scp"), str)
+                   else list(payload.get("scp") or [])),
     }
     access_cache[char_id] = (tok["access_token"],
                              time.time() + tok.get("expires_in", 1000) - 60)
@@ -597,6 +603,33 @@ def implant_details(type_ids, names):
     return out
 
 
+def apply_finished_skills(skills, queue):
+    """ESI only writes finished skills into /skills/ when the queue is next
+    processed (usually when the character logs in), and leaves them in the
+    queue until then. Count queue entries whose finish time has passed as
+    trained and drop them from the queue. Returns (skills, queue) copies -
+    the ESI results are cached and must not be changed in place."""
+    now = time.time()
+    have = {r["skill_id"]: dict(r) for r in skills.get("skills", [])}
+    total = skills.get("total_sp", 0)
+    left = []
+    for r in queue:
+        ts = _iso_ts(r.get("finish_date"))
+        if ts is None or ts > now:
+            left.append(r)
+            continue
+        cur = have.setdefault(r["skill_id"], {
+            "skill_id": r["skill_id"], "trained_skill_level": 0,
+            "active_skill_level": 0, "skillpoints_in_skill": 0})
+        lvl = r.get("finished_level") or 0
+        if lvl > cur["trained_skill_level"]:
+            gain = max(0, (r.get("level_end_sp") or 0) - cur["skillpoints_in_skill"])
+            cur["trained_skill_level"] = cur["active_skill_level"] = lvl
+            cur["skillpoints_in_skill"] += gain
+            total += gain
+    return {**skills, "skills": list(have.values()), "total_sp": total}, left
+
+
 def char_summary(char_id):
     tok = get_access_token(char_id)
     cid = int(char_id)
@@ -606,6 +639,7 @@ def char_summary(char_id):
     wallet, _ = esi_fetch(f"/characters/{cid}/wallet/", tok, use_cache=False)
     attrs, _ = esi_fetch(f"/characters/{cid}/attributes/", tok)
     implants, _ = esi_fetch(f"/characters/{cid}/implants/", tok)
+    skills, queue = apply_finished_skills(skills, queue)
     names = esi_names(implants) if implants else {}
     corp_name = esi_names([pub["corporation_id"]]).get(
         pub.get("corporation_id"), {}).get("name", "") if pub.get("corporation_id") else ""
@@ -969,6 +1003,259 @@ def archiver_loop():
                 pass
             time.sleep(3)
         time.sleep(2 * 3600)
+
+
+# ----------------------------------------------------------------------------
+# Notifications: a quiet background watcher. ESI is asked once per check
+# interval (default 1 hour); "skill finished" and "queue running low" are then
+# worked out locally from the stored queue, so they fire on time without
+# extra requests.
+# ----------------------------------------------------------------------------
+NOTIFY_PATH = os.path.join(DATA_DIR, "notifications.json")
+NOTIFY_STATE_PATH = os.path.join(DATA_DIR, "notify_state.json")
+NOTIFY_KINDS = [
+    ("skill_done", "A skill finishes training"),
+    ("queue_low", "The skill queue is running low or empty"),
+    ("item_sold", "An item is sold on the market"),
+    ("contract_done", "One of my contracts is sold / accepted"),
+    ("job_done", "An industry job is finished"),
+]
+CHECK_CHOICES = [15, 30, 60, 120, 240]
+notif_feed = load_json(NOTIFY_PATH, [])
+notif_state = load_json(NOTIFY_STATE_PATH, {})
+_notif_lock = threading.Lock()
+_notify_force = threading.Event()
+notify_info = {"last_check": 0, "errors": {}}
+
+
+def notify_cfg():
+    kinds = config.get("notify") or {}
+    return {
+        "enabled": config.get("notify_on", True),
+        "os": config.get("notify_os", True),
+        "kinds": {k: bool(kinds.get(k, True)) for k, _ in NOTIFY_KINDS},
+        "check_minutes": int(config.get("check_minutes") or 60),
+        "queue_low_hours": float(config.get("queue_low_hours") or 24),
+    }
+
+
+def notify_os(title, text):
+    """Native desktop notice: tray balloon/toast, else notify-send."""
+    try:
+        import evewatch_tray
+        if evewatch_tray.notify(title, text):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            import subprocess
+            subprocess.Popen(["notify-send", "-a", "EveWatch", title, text])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def push_notification(kind, title, text, os_notice=True):
+    with _notif_lock:
+        # time-based so ids keep increasing after "Clear list"
+        nid = max(int(time.time() * 1000),
+                  (notif_feed[-1]["id"] + 1) if notif_feed else 0)
+        notif_feed.append({"id": nid, "ts": int(time.time()), "kind": kind,
+                           "title": title, "text": text})
+        del notif_feed[:-100]
+        save_json(NOTIFY_PATH, notif_feed)
+    if os_notice and notify_cfg()["os"]:
+        notify_os(title, text)
+
+
+def _iso_ts(s):
+    try:
+        return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _isk(v):
+    return f"{v:,.0f} ISK"
+
+
+def _hours_text(h):
+    if h < 1:
+        return f"{int(h * 60)} min"
+    return f"{h:.1f} h" if h < 10 else f"{int(h)} h"
+
+
+def notify_poll(cid, st, kinds):
+    """The ESI part: refresh what the local checks work from."""
+    tok = get_access_token(cid)
+    name = tokens[cid]["name"]
+    errs = notify_info["errors"]
+    errs.pop(cid, None)
+    if kinds["skill_done"] or kinds["queue_low"]:
+        q, _ = esi_fetch(f"/characters/{cid}/skillqueue/", tok, use_cache=False)
+        st["queue"] = [{"skill": r["skill_id"], "level": r.get("finished_level"),
+                        "finish": r.get("finish_date")} for r in q]
+        st["queue_ts"] = time.time()
+        if "done" not in st:           # first look: don't announce old news
+            st["done"] = [f'{r["skill"]}:{r["level"]}:{r["finish"]}'
+                          for r in st["queue"]
+                          if (_iso_ts(r["finish"]) or 9e12) < time.time()]
+    if kinds["item_sold"]:
+        rows, _ = esi_fetch(f"/characters/{cid}/wallet/transactions/", tok,
+                            use_cache=False)
+        top = max([r["transaction_id"] for r in rows], default=0)
+        if "tx_last" in st:
+            sells = [r for r in rows
+                     if r["transaction_id"] > st["tx_last"] and not r["is_buy"]]
+            if sells:
+                total = sum(r["quantity"] * r["unit_price"] for r in sells)
+                names = []
+                for r in sells[:3]:
+                    names.append(f'{r["quantity"]:,} × '
+                                 f'{get_type_info(r["type_id"])["name"]}')
+                more = f" and {len(sells) - 3} more" if len(sells) > 3 else ""
+                push_notification(
+                    "item_sold", f"{name}: sold on the market",
+                    f'{", ".join(names)}{more} — {_isk(total)}')
+                save_json(TYPES_PATH, type_info)
+        st["tx_last"] = max(top, st.get("tx_last", 0))
+    if kinds["contract_done"]:
+        scopes = tokens[cid].get("scopes")
+        if scopes is not None and CONTRACTS_SCOPE not in scopes:
+            errs[cid] = "contracts: character needs the contracts permission"
+        else:
+            try:
+                rows = esi_fetch_pages(f"/characters/{cid}/contracts/", tok,
+                                       max_pages=3)
+            except RuntimeError as e:
+                if " 403 " in str(e) or " 401 " in str(e):
+                    errs[cid] = "contracts: character needs the contracts permission"
+                    rows = None
+                else:
+                    raise
+            if rows is not None:
+                mine = [r for r in rows
+                        if r.get("issuer_id") == int(cid)
+                        and not r.get("for_corporation")
+                        and r.get("type") in ("item_exchange", "auction")
+                        and str(r.get("status", "")).startswith("finished")]
+                seen = set(st.get("contracts_done", []))
+                if "contracts_done" in st:
+                    for r in mine:
+                        if r["contract_id"] not in seen:
+                            amount = r.get("price") or r.get("buyout") or 0
+                            push_notification(
+                                "contract_done", f"{name}: contract completed",
+                                f'{r.get("title") or "Contract"} — '
+                                f'{_isk(amount)}')
+                st["contracts_done"] = sorted(
+                    seen | {r["contract_id"] for r in mine})[-300:]
+    if kinds["job_done"]:
+        rows, _ = esi_fetch(f"/characters/{cid}/industry/jobs/", tok,
+                            use_cache=False)
+        st["jobs"] = {str(r["job_id"]): {
+            "end": r.get("end_date"),
+            "name": get_type_info(r.get("product_type_id")
+                                  or r["blueprint_type_id"])["name"]}
+            for r in rows if r.get("status") == "active"}
+        save_json(TYPES_PATH, type_info)
+        st.setdefault("jobs_done", [])
+
+
+def notify_local(cid, st, kinds, cfg):
+    """No network: works from the stored queue/jobs, so it's on time."""
+    now = time.time()
+    name = tokens[cid]["name"]
+    q = st.get("queue")
+    if q is not None and kinds["skill_done"]:
+        done = st.setdefault("done", [])
+        for r in q:
+            ts = _iso_ts(r["finish"])
+            key = f'{r["skill"]}:{r["level"]}:{r["finish"]}'
+            if ts and ts <= now and key not in done:
+                done.append(key)
+                if now - ts < 12 * 3600:      # not stale news after downtime
+                    push_notification(
+                        "skill_done", f"{name}: skill finished",
+                        f'{get_type_info(r["skill"])["name"]} '
+                        f'{["", "I", "II", "III", "IV", "V"][r["level"] or 0]}')
+        del done[:-200]
+    if q is not None and kinds["queue_low"]:
+        ends = [_iso_ts(r["finish"]) for r in q if r.get("finish")]
+        if q and not ends:                        # queue paused
+            remain = 0
+        else:
+            remain = (max(ends) - now) / 3600 if ends else 0
+            remain = max(remain, 0)
+        if remain > cfg["queue_low_hours"]:
+            st["low"] = False
+        elif not st.get("low"):
+            st["low"] = True
+            if not ends or remain <= 0:
+                push_notification(
+                    "queue_low", f"{name}: skill queue is empty",
+                    "Nothing is training — add skills to the queue.")
+            else:
+                push_notification(
+                    "queue_low", f"{name}: skill queue running low",
+                    f"About {_hours_text(remain)} of training left.")
+    if kinds["job_done"]:
+        done = st.setdefault("jobs_done", [])
+        for jid, j in (st.get("jobs") or {}).items():
+            ts = _iso_ts(j["end"])
+            if ts and ts <= now and jid not in done:
+                done.append(jid)
+                if now - ts < 12 * 3600:
+                    push_notification("job_done", f"{name}: industry job finished",
+                                      j["name"])
+        del done[:-200]
+
+
+def notify_loop():
+    time.sleep(45)
+    last_poll = 0
+    while True:
+        try:
+            cfg = notify_cfg()
+            if cfg["enabled"] and config.get("client_id"):
+                due = (time.time() - last_poll >= cfg["check_minutes"] * 60
+                       or _notify_force.is_set())
+                _notify_force.clear()
+                if due:
+                    last_poll = time.time()
+                    notify_info["last_check"] = int(last_poll)
+                for cid in list(tokens):
+                    st = notif_state.setdefault(cid, {})
+                    try:
+                        if due:
+                            notify_poll(cid, st, cfg["kinds"])
+                        notify_local(cid, st, cfg["kinds"], cfg)
+                    except Exception as e:  # noqa: BLE001
+                        notify_info["errors"][cid] = str(e)[:160]
+                    if due:
+                        time.sleep(2)
+                save_json(NOTIFY_STATE_PATH, notif_state)
+        except Exception as e:  # noqa: BLE001
+            print("notify loop:", e)
+        for _ in range(30):               # wake early on "Check now"
+            if _notify_force.is_set():
+                break
+            time.sleep(1)
+
+
+def notify_status():
+    cfg = notify_cfg()
+    return {
+        **cfg,
+        "kinds_list": [{"id": k, "label": l, "on": cfg["kinds"][k]}
+                       for k, l in NOTIFY_KINDS],
+        "choices": CHECK_CHOICES,
+        "last_check": notify_info["last_check"],
+        "errors": list(notify_info["errors"].values()),
+        "contracts_scope": bool(config.get("scope_contracts")),
+        "feed": notif_feed[-30:][::-1],
+        "latest": notif_feed[-1]["id"] if notif_feed else 0,
+    }
 
 
 _prices_cache = {"ts": 0, "data": {}}
@@ -1765,6 +2052,78 @@ def update_repo():
     return "" if (not r or r.startswith("@@")) else r
 
 
+def _autostart_cmd():
+    """Command line that starts EveWatch quietly (no browser) at login."""
+    if FROZEN:
+        return [sys.executable, "--no-browser"]
+    py = sys.executable
+    if os.name == "nt" and py.lower().endswith("python.exe"):
+        pw = py[:-10] + "pythonw.exe"
+        py = pw if os.path.exists(pw) else py
+    return [py, os.path.abspath(__file__), "--no-browser"]
+
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_LINUX_AUTOSTART = os.path.join(os.path.expanduser("~"), ".config",
+                                "autostart", "evewatch.desktop")
+
+
+def _win_startup_lnk():
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                        "Start Menu", "Programs", "Startup", "EveWatch.lnk")
+
+
+def autostart_enabled():
+    try:
+        if os.name == "nt":
+            import winreg
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                    winreg.QueryValueEx(k, "EveWatch")
+                    return True
+            except OSError:
+                return os.path.exists(_win_startup_lnk())
+        return os.path.exists(_LINUX_AUTOSTART)
+    except Exception:
+        return False
+
+
+def set_autostart(on):
+    if os.name == "nt":
+        import winreg
+        if on:
+            cmd = " ".join('"%s"' % c if " " in c else c
+                           for c in _autostart_cmd())
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                winreg.SetValueEx(k, "EveWatch", 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, "EveWatch")
+            except OSError:
+                pass
+            # also remove the shortcut the installer may have created
+            try:
+                os.remove(_win_startup_lnk())
+            except OSError:
+                pass
+        return
+    if on:
+        os.makedirs(os.path.dirname(_LINUX_AUTOSTART), exist_ok=True)
+        cmd = " ".join('"%s"' % c if " " in c else c
+                       for c in _autostart_cmd())
+        with open(_LINUX_AUTOSTART, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=EveWatch\n"
+                    "Comment=Personal EVE Online tool\nExec=%s\n"
+                    "Terminal=false\nX-GNOME-Autostart-enabled=true\n" % cmd)
+    else:
+        try:
+            os.remove(_LINUX_AUTOSTART)
+        except OSError:
+            pass
+
+
 def check_update(force=False):
     if not force and _update_cache["data"] and \
             time.time() - _update_cache["ts"] < 3600:
@@ -1821,10 +2180,17 @@ mastery_status = {"state": "idle", "error": "", "done": 0, "total": 0}
 _mastery = {"data": None}
 
 
-def build_masteries(mastery_lines, cert_lines, build=None):
+def build_masteries(mastery_lines, cert_lines, build=None,
+                    group_lines=None, type_lines=None):
     """Compact form: ships {shipId: [tier1certs..tier5certs]} and certs
-    {certId: {n: name, s: {skillId: [req at I..V]}}}. Tier N needs every
-    certificate of that tier trained to grade N (basic..elite)."""
+    {certId: {n: name, g: group, s: {skillId: [req at I..V]}}}. Tier N needs
+    every certificate of that tier trained to grade N (basic..elite).
+    With groups/types also info {shipId: [ship group, tech level, name]}
+    (used by the Accomplishments tab)."""
+    groups = {}
+    for line in group_lines or []:
+        g = json.loads(line)
+        groups[g["_key"]] = (g.get("name") or {}).get("en", "")
     ships = {}
     for line in mastery_lines:
         d = json.loads(line)
@@ -1838,11 +2204,26 @@ def build_masteries(mastery_lines, cert_lines, build=None):
             continue
         certs[str(d["_key"])] = {
             "n": d["name"]["en"],
+            "g": groups.get(d.get("groupID"), ""),
             "s": {str(sk["_key"]): [sk.get("basic", 0), sk.get("standard", 0),
                                      sk.get("improved", 0), sk.get("advanced", 0),
                                      sk.get("elite", 0)]
                   for sk in d.get("skillTypes", [])}}
-    return {"build": build, "ships": ships, "certs": certs}
+    info = {}
+    for line in type_lines or []:          # types.jsonl is big: skip non-ships fast
+        if isinstance(line, bytes):
+            m = re.match(rb'\{"_key":\s*(\d+)', line)
+            if not m or m.group(1).decode() not in ships:
+                continue
+        t = json.loads(line)
+        if str(t["_key"]) in ships:
+            info[str(t["_key"])] = [groups.get(t.get("groupID"), ""),
+                                    t.get("techLevel") or 1,
+                                    (t.get("name") or {}).get("en", "")]
+    out = {"build": build, "ships": ships, "certs": certs}
+    if info:
+        out["info"] = info
+    return out
 
 
 BONUS_PATH = os.path.join(DATA_DIR, "ship_bonuses.json")
@@ -1907,7 +2288,8 @@ def load_masteries():
     best = None
     for path in (MASTERY_PATH, resource_path(os.path.join("assets", "ship_masteries.json"))):
         d = load_json(path, None)
-        if d and d.get("ships") and (best is None or (d.get("build") or 0) > (best.get("build") or 0)):
+        rank = lambda x: ((x.get("build") or 0), bool(x.get("info")))   # noqa: E731
+        if d and d.get("ships") and (best is None or rank(d) > rank(best)):
             best = d
     _mastery["data"] = best or {"build": None, "ships": {}, "certs": {}}
     return _mastery["data"]
@@ -1942,9 +2324,11 @@ def refresh_masteries():
                 if "_sde.jsonl" in names:
                     build = json.loads(z.read("_sde.jsonl").decode().splitlines()[0]
                                        ).get("buildNumber")
-                data = build_masteries(
-                    z.read("masteries.jsonl").decode("utf-8").splitlines(),
-                    z.read("certificates.jsonl").decode("utf-8").splitlines(), build)
+                with z.open("types.jsonl") as types:
+                    data = build_masteries(
+                        z.read("masteries.jsonl").decode("utf-8").splitlines(),
+                        z.read("certificates.jsonl").decode("utf-8").splitlines(), build,
+                        z.read("groups.jsonl").decode("utf-8").splitlines(), types)
                 bonus = None
                 if "typeBonus.jsonl" in names:
                     bonus = {"build": build, "types": build_bonuses(
@@ -2414,6 +2798,7 @@ class Handler(BaseHTTPRequestHandler):
                 "client_id_set": bool(config.get("client_id")),
                 "version": APP_VERSION, "data_dir": DATA_DIR,
                 "quit_on_close": bool(config.get("quit_on_close")),
+                "autostart": autostart_enabled(),
                 "update_repo": update_repo(),
                 "callback_url": CALLBACK_URL,
                 "scopes": SCOPES,
@@ -2421,6 +2806,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scope_extras": bool(config.get("scope_extras")),
                 "scope_research": bool(config.get("scope_research")),
                 "research_scope": RESEARCH_SCOPE,
+                "scope_contracts": bool(config.get("scope_contracts")),
+                "contracts_scope": CONTRACTS_SCOPE,
                 "characters": [{"character_id": r["character_id"],
                                 "name": r["name"]} for r in tokens.values()],
                 "catalog": ({"state": "done",
@@ -2436,6 +2823,8 @@ class Handler(BaseHTTPRequestHandler):
                 config["scope_extras"] = bool(body["scope_extras"])
             if "scope_research" in body:
                 config["scope_research"] = bool(body["scope_research"])
+            if "scope_contracts" in body:
+                config["scope_contracts"] = bool(body["scope_contracts"])
             if "quit_on_close" in body:
                 config["quit_on_close"] = bool(body["quit_on_close"])
             save_json(CONFIG_PATH, config)
@@ -2650,6 +3039,50 @@ class Handler(BaseHTTPRequestHandler):
 
         elif p == "/api/update" and method == "GET":
             self._send(200, check_update(force="force" in q))
+
+        elif p == "/api/notify" and method == "GET":
+            self._send(200, notify_status())
+
+        elif p == "/api/notify/config" and method == "POST":
+            b = self._json_body()
+            if "enabled" in b:
+                config["notify_on"] = bool(b["enabled"])
+            if "os" in b:
+                config["notify_os"] = bool(b["os"])
+            if isinstance(b.get("kinds"), dict):
+                cur = dict(config.get("notify") or {})
+                for k, _ in NOTIFY_KINDS:
+                    if k in b["kinds"]:
+                        cur[k] = bool(b["kinds"][k])
+                config["notify"] = cur
+            if "check_minutes" in b and int(b["check_minutes"]) in CHECK_CHOICES:
+                config["check_minutes"] = int(b["check_minutes"])
+            if "queue_low_hours" in b:
+                config["queue_low_hours"] = max(1, min(float(b["queue_low_hours"]), 720))
+            save_json(CONFIG_PATH, config)
+            self._send(200, notify_status())
+
+        elif p == "/api/notify/test" and method == "POST":
+            push_notification("test", "EveWatch test notification",
+                              "If you can see this, notifications work.")
+            self._send(200, notify_status())
+
+        elif p == "/api/notify/check" and method == "POST":
+            _notify_force.set()
+            self._send(200, {"ok": True})
+
+        elif p == "/api/notify/clear" and method == "POST":
+            with _notif_lock:
+                notif_feed.clear()
+                save_json(NOTIFY_PATH, notif_feed)
+            self._send(200, notify_status())
+
+        elif p == "/api/autostart" and method == "POST":
+            try:
+                set_autostart(bool(self._json_body().get("on")))
+                self._send(200, {"ok": True, "autostart": autostart_enabled()})
+            except Exception as e:
+                self._send(500, {"error": f"Could not change it: {e}"})
 
         elif p == "/api/open_data" and method == "POST":
             open_folder(DATA_DIR)
@@ -2916,15 +3349,74 @@ nav button.locked{opacity:.38;cursor:not-allowed}
 .cs-pop .sw button{margin:0}
 .cs-pop .sw button.on{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
 .cs-foot{text-align:center;margin-top:28px;color:var(--dim);font-size:12.5px}
-.helpwrap{position:relative}
-.helppop{position:absolute;right:0;top:calc(100% + 6px);z-index:80;width:340px;
+/* Accomplishments: certificate / mastery level colours (I..V) */
+body{--l1:#8592a6;--l2:#3fb27f;--l3:#4a90e2;--l4:#a274f0;--l5:#e0b455}
+body[data-mode=light]{--l1:#7a8699;--l2:#1a8f5c;--l3:#1f6feb;--l4:#7a3fe0;--l5:#a8710c}
+.lv1{color:var(--l1)} .lv2{color:var(--l2)} .lv3{color:var(--l3)} .lv4{color:var(--l4)} .lv5{color:var(--l5)}
+.ac-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:var(--gap)}
+.ac-tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px;box-shadow:var(--shadow)}
+.ac-tile .k{font-size:11.5px;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim)}
+.ac-tile .v{font-size:26px;font-weight:700;line-height:1.25}
+.ac-tile .s{font-size:12px;color:var(--dim)}
+.ac-top{display:grid;grid-template-columns:1.3fr 1fr;gap:var(--gap)}
+.ac-top>.card{margin-bottom:var(--gap)}
+@media(max-width:1050px){.ac-top{grid-template-columns:1fr}}
+.ac-sub{margin:-4px 0 12px;font-size:12.5px;color:var(--dim)}
+.ac-medals{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px}
+.ac-medal{text-align:center;padding:12px 6px;border-radius:var(--radius-sm);background:var(--panel2);border:1px solid var(--line)}
+.ac-medal .disc{width:52px;height:52px;margin:0 auto 6px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:16px;
+  color:#0b0e14;box-shadow:inset 0 -4px 0 rgba(0,0,0,.25),0 0 0 3px var(--panel),0 0 0 4px var(--line)}
+.ac-medal .t{font-size:12.5px;font-weight:600;line-height:1.3}
+.ac-medal .d{font-size:11.5px;color:var(--dim)}
+.ac-medal.locked{opacity:.45;filter:grayscale(1)}
+.ac-next .row{display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);margin:0}
+.ac-next .grow{flex:1;min-width:0}
+.ac-pips{display:inline-flex;gap:3px}
+.ac-pips i{width:16px;height:6px;border-radius:2px;background:var(--panel2);outline:1px solid var(--line)}
+.ac-filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.ac-chip{padding:3px 11px;border-radius:12px;background:var(--panel2);outline:1px solid var(--line);border:0;color:var(--txt);font:inherit;font-size:12.5px;cursor:pointer}
+.ac-chip.on{background:var(--acc);color:var(--acc-ink);outline-color:var(--acc)}
+.ac-group{margin-bottom:16px}
+.ac-group h3{margin:0 0 8px;font-size:12px;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim)}
+.ac-cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}
+.ac-cert{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius-sm);padding:9px 12px;display:flex;flex-direction:column;gap:5px}
+.ac-cert .top{display:flex;justify-content:space-between;gap:8px}
+.ac-cert.l5{border-color:var(--l5)}
+.ac-cert.l0{opacity:.6}
+.ac-link{background:none;border:0;color:var(--acc);cursor:pointer;font:inherit;font-size:12.5px;padding:0}
+.ac-stack{display:flex;height:10px;border-radius:3px;overflow:hidden;background:var(--panel2);min-width:140px}
+.ac-stack i{display:block;height:100%}
+.ac-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:10px}
+.ac-legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;background:var(--c)}
+.hm-bg{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.55);
+  display:none;align-items:flex-start;justify-content:center;padding:6vh 16px}
+.hm{width:min(780px,100%);max-height:88vh;display:flex;flex-direction:column;
   background:linear-gradient(var(--panel2),var(--panel2)),var(--pop,#0e1420);
   border:1px solid var(--line);border-radius:var(--radius-sm);
-  box-shadow:0 8px 24px rgba(0,0,0,.5);padding:6px}
-.helppop .mi{padding:8px 12px;cursor:pointer;border-radius:var(--radius-sm)}
-.helppop .mi:hover{background:var(--panel);color:var(--acc)}
-.helppop .sep{border-top:1px solid var(--line);margin:4px 0}
-.helppop .info{padding:8px 12px;font-size:12.5px}
+  box-shadow:0 12px 40px rgba(0,0,0,.6)}
+.hm-head{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
+.hm-head h3{margin:0;font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold)}
+.hm-x{background:none;border:none;color:var(--dim);font-size:18px;cursor:pointer}
+.hm-x:hover{color:var(--txt)}
+.hm-body{display:flex;flex:1;min-height:0}
+.hm-nav{width:190px;flex:none;border-right:1px solid var(--line);padding:8px}
+.hm-nav div{padding:8px 12px;cursor:pointer;border-radius:var(--radius-sm)}
+.hm-nav div:hover{color:var(--acc)}
+.hm-nav div.on{background:var(--panel);color:var(--acc)}
+.hm-sec{flex:1;overflow:auto;padding:12px 18px 16px}
+.hm-sec h4{margin:16px 0 4px;font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim)}
+.hm-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}
+.hm-row .grow{flex:1;min-width:0}
+.hm-row label.grow{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
+.hm-row label.grow input{margin-top:3px}
+.hm-row.off{opacity:.5}
+.hm .small{font-size:12.5px}
+.hm-info{padding:9px 12px;margin:4px 0 8px;border-radius:var(--radius-sm);
+  background:var(--panel);border-left:3px solid var(--gold);font-size:13px}
+.hm-feed div{padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+.hm-foot{display:flex;align-items:center;padding:10px 16px;border-top:1px solid var(--line)}
+@media(max-width:620px){.hm-body{flex-direction:column}
+  .hm-nav{width:auto;display:flex;border-right:none;border-bottom:1px solid var(--line)}}
 .ipanel{border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel2);
   margin:0 0 14px;overflow:hidden}
 .ipanel>.ihead{padding:7px 14px;border-bottom:1px solid var(--line);font-weight:700;
@@ -3016,12 +3508,10 @@ th.sortable:hover{color:var(--acc)}
   <nav id="nav"></nav>
   <div style="flex:1"></div>
   <div id="activeChar" class="hchar"></div>
-  <div class="helpwrap">
-    <button class="btn sec" id="helpBtn" onclick="toggleHelp(event)">Help
-      <span id="updDot" style="display:none;color:var(--gold)">●</span> ▾</button>
-    <div id="helpPop" class="helppop" style="display:none"></div>
-  </div>
+  <button class="btn sec" id="helpBtn" onclick="openHelp()">Help &amp; settings
+    <span id="updDot" style="display:none;color:var(--gold)">●</span></button>
 </header>
+<div id="helpModal" class="hm-bg" onclick="closeHelp()"></div>
 <main id="main"></main>
 <div id="toast"></div>
 <script>
@@ -3041,7 +3531,7 @@ const state = {status:null, chars:{}, cards:{}, screen:"app", popFor:null, catal
 const TABS = [["characters","Characters"],["overview","Overview"],["skills","Skills"],
               ["assets","Assets"],["wallet","Wallet"],["lpstore","LP Store"],["market","Market"],
               ["itemsearch","Item Search"],["contracts","Contracts"],
-              ["industry","Industry"]];
+              ["industry","Industry"],["accomplishments","Accomplishments"]];
 
 /* ---------------- Per-character themes ---------------- */
 const THEMES=[["classic","Capsuleer Classic"],["glass","Nebula Glass"],
@@ -3084,16 +3574,17 @@ function headerChar(){
     c.character_id}/portrait?size=64" alt=""><span>${esc(c.name)}</span></div>`;
 }
 
-/* ---------------- Help menu / updates ---------------- */
-function toggleHelp(ev){
-  if(ev) ev.stopPropagation();
-  const el=$("#helpPop");
-  if(el.style.display==="block"){ el.style.display="none"; return; }
-  helpMain(); el.style.display="block";
+/* ---------------- Help & settings window / updates ---------------- */
+const HELP_SECS=[["about","About & updates"],["general","General"],["notify","Notifications"]];
+const help={open:false, sec:"about", notif:null, updNewer:false};
+function openHelp(sec){
+  if(sec) help.sec=sec;
+  help.open=true; $("#helpModal").style.display="flex";
+  if(help.sec==="notify") loadNotify(); else helpMain();
 }
-document.addEventListener("click",e=>{
-  if(!document.body.contains(e.target)) return;      // target was re-rendered away
-  const el=$("#helpPop"); if(el && !e.target.closest(".helpwrap")) el.style.display="none"; });
+function closeHelp(){ help.open=false; $("#helpModal").style.display="none"; }
+function helpGo(sec){ help.sec=sec; if(sec==="notify") loadNotify(); else helpMain(); }
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&help.open) closeHelp(); });
 const TAB_ID=Math.random().toString(36).slice(2);
 function heartbeat(){
   fetch("/api/heartbeat",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -3126,32 +3617,167 @@ async function toggleCloseOnExit(){
     ?"<b>Close on Exit is ON.</b> EveWatch stops when you close its last browser tab. "+
      "Background tracking (wallet archive, contract index) only runs while a tab is open."
     :"<b>Close on Exit is OFF.</b> EveWatch keeps running in the background after you close "+
-     "the tab. Quit it from the tray icon or Help → Quit EveWatch.");
+     "the tab. Quit it from the tray icon or Help & settings → Quit EveWatch.");
 }
+const AS_LABEL=/Win/.test(navigator.platform)?"Start with Windows":"Start at login";
+async function toggleAutostart(){
+  const on=!state.status.autostart;
+  try{
+    const r=await api("/api/autostart",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({on})});
+    state.status.autostart=r.autostart;
+    helpMain(r.autostart
+      ?`<b>${AS_LABEL} is ON.</b> EveWatch starts quietly in the background when you sign in.`
+      :`<b>${AS_LABEL} is OFF.</b>`);
+  }catch(e){ helpMain(`<span class="bad">${esc(e.message)}</span>`); }
+}
+function onOff(on){
+  return `<b style="color:${on?"var(--good)":"var(--dim)"}">${on?"ON":"OFF"}</b>`; }
 function helpMain(extra){
   const st=state.status||{};
-  $("#helpPop").innerHTML=`
-    <div class="mi" onclick="helpUpdate()">Check for updates…</div>
-    <div class="mi" onclick="openSettings()">Setup &amp; loyalty points…</div>
-    <div class="mi" onclick="refreshMasteries()">Refresh ship mastery data</div>
-    <div class="mi" onclick="toggleCloseOnExit()">Close on Exit:
-      <b style="color:${st.quit_on_close?"var(--good)":"var(--dim)"}">${
-      st.quit_on_close?"ON":"OFF"}</b></div>
-    <div class="mi" onclick="helpAbout()">About EveWatch</div>
-    <div class="mi" onclick="api('/api/open_data',{method:'POST'}).catch(e=>toast(e.message))">
-      Open data folder</div>
-    <div class="sep"></div>
-    <div class="mi" onclick="helpQuit()">Quit EveWatch</div>
-    ${extra?`<div class="sep"></div><div class="info">${extra}</div>`:""}`;
+  let body="";
+  if(help.sec==="about") body=`
+    <h4>EveWatch ${esc(st.version||"")}</h4>
+    <p style="margin:4px 0 10px">A personal tool using EVE's public API (ESI).
+      Everything stays on this computer.</p>
+    <div class="hm-row"><div class="grow">Updates<div class="dim small">${
+      st.update_repo?"github.com/"+esc(st.update_repo):"No update source in this copy"}</div></div>
+      <button class="btn sec" onclick="helpUpdate()">Check for updates</button></div>`;
+  else if(help.sec==="general") body=`
+    <div class="hm-row"><label class="grow"><input type="checkbox" ${st.autostart?"checked":""}
+      onchange="toggleAutostart()"><span>${AS_LABEL}<div class="dim small">EveWatch starts quietly
+      in the background when you sign in.</div></span></label></div>
+    <div class="hm-row"><label class="grow"><input type="checkbox" ${st.quit_on_close?"checked":""}
+      onchange="toggleCloseOnExit()"><span>Close on Exit<div class="dim small">Quit EveWatch when its
+      last browser tab closes. Notifications and background tracking stop with it.</div></span></label></div>
+    <div class="hm-row"><div class="grow">Setup &amp; permissions<div class="dim small">Developer
+      application, loyalty/research/contracts permissions.</div></div>
+      <button class="btn sec" onclick="openSettings()">Open…</button></div>
+    <div class="hm-row"><div class="grow">Ship mastery data<div class="dim small">Downloads CCP's
+      static data (about 100 MB).</div></div>
+      <button class="btn sec" onclick="refreshMasteries()">Refresh</button></div>
+    <div class="hm-row"><div class="grow">Data folder<div class="dim small" style="word-break:break-all">${
+      esc(st.data_dir||"")}</div></div>
+      <button class="btn sec" onclick="api('/api/open_data',{method:'POST'}).catch(e=>toast(e.message))">Open</button></div>`;
+  else body=notifyHtml();
+  $("#helpModal").innerHTML=`<div class="hm" onclick="event.stopPropagation()">
+    <div class="hm-head"><h3>Help &amp; settings</h3><div style="flex:1"></div>
+      <button class="hm-x" title="Close (Esc)" onclick="closeHelp()">✕</button></div>
+    <div class="hm-body"><div class="hm-nav">${HELP_SECS.map(([id,l])=>
+      `<div class="${help.sec===id?"on":""}" onclick="helpGo('${id}')">${esc(l)}${
+        (id==="notify"&&unreadNotes())||(id==="about"&&help.updNewer)
+          ?' <span style="color:var(--gold)">●</span>':""}</div>`).join("")}</div>
+    <div class="hm-sec">${extra?`<div class="hm-info">${extra}</div>`:""}${body}</div></div>
+    <div class="hm-foot"><span class="dim small">EveWatch ${esc(st.version||"")}</span>
+      <div style="flex:1"></div><button class="btn sec" onclick="helpQuit()">Quit EveWatch</button></div></div>`;
 }
-function helpAbout(){
-  const st=state.status||{};
-  helpMain(`<b>EveWatch ${esc(st.version||"")}</b><br>
-    A personal tool using EVE's public API (ESI). Everything stays on this
-    computer.<br><span class="dim">Data folder:<br>${esc(st.data_dir||"")}</span>
-    ${st.update_repo?`<br><span class="dim">Updates: github.com/${esc(st.update_repo)}</span>`:""}`);
+
+/* ---- Notifications section ---- */
+function agoText(ts){
+  const m=Math.round((Date.now()/1000-ts)/60);
+  return m<1?"just now":m<60?m+" min ago":Math.floor(m/60)+" h "+(m%60)+" min ago";
+}
+function minutesLabel(m){ return m<60?m+" minutes":m===60?"1 hour":(m/60)+" hours"; }
+function kindNote(k,n){
+  if(k.id==="contract_done"&&!n.contracts_scope)
+    return `<div class="warn small">Needs the contracts permission —
+      <a href="#" onclick="openSettings();return false">Setup &amp; permissions</a>.</div>`;
+  if(k.id==="item_sold")
+    return `<div class="dim small">EVE refreshes wallet transactions about once an hour, so this can lag.</div>`;
+  return "";
+}
+function notifyHtml(){
+  const n=help.notif;
+  if(!n) return `<p class="dim">Loading…</p>`;
+  const off=n.enabled?"":"off";
+  return `
+    <div class="hm-row"><label class="grow"><input type="checkbox" ${n.enabled?"checked":""}
+      onchange="notifySet({enabled:this.checked})"><span><b>Watch in the background</b>
+      <div class="dim small">Checks EVE's API for all your characters and lets you know when
+      something happens. Works while EveWatch is running, even with no tab open.</div></span></label></div>
+    <div class="hm-row ${off}"><div class="grow">Check EVE's API every
+      <div class="dim small">Last check: ${n.last_check?agoText(n.last_check):"not yet"}.
+      Skill and industry timers are watched every 30 s in between, without extra API calls.</div></div>
+      <select onchange="notifySet({check_minutes:+this.value})">${n.choices.map(m=>
+        `<option value="${m}" ${m===n.check_minutes?"selected":""}>${minutesLabel(m)}</option>`).join("")}</select>
+      <button class="btn sec" onclick="notifyCheckNow()">Check now</button></div>
+    <h4>Notify me when…</h4>
+    ${n.kinds_list.map(k=>`<div class="hm-row ${off}"><label class="grow"><input type="checkbox"
+      ${k.on?"checked":""} onchange="notifySet({kinds:{${k.id}:this.checked}})"><span>${esc(k.label)}${
+      kindNote(k,n)}</span></label>${k.id==="queue_low"?`<span class="small">under
+      <input type="number" min="1" max="720" step="1" value="${n.queue_low_hours}" style="width:70px"
+        onchange="notifySet({queue_low_hours:+this.value})"> hours</span>`:""}</div>`).join("")}
+    <h4>How</h4>
+    <div class="hm-row ${off}"><label class="grow"><input type="checkbox" ${n.os?"checked":""}
+      onchange="notifySet({os:this.checked})"><span>Show desktop pop-ups<div class="dim small">${
+      /Win/.test(navigator.platform)?"A Windows notification from the tray icon.":"A desktop notification (notify-send)."}
+      Notices also pop up in an open EveWatch tab.</div></span></label></div>
+    <div class="hm-row"><div class="grow"></div>
+      <button class="btn sec" onclick="notifyTest()">Send a test notice</button>
+      <button class="btn sec" onclick="notifyClear()">Clear list</button></div>
+    ${n.errors.length?`<div class="hm-info"><span class="warn">Last check had problems:</span><br>${
+      n.errors.map(esc).join("<br>")}</div>`:""}
+    <h4>Recent</h4>
+    <div class="hm-feed">${n.feed.length?n.feed.map(x=>`<div><span class="dim small">${
+      new Date(x.ts*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</span>
+      <b>${esc(x.title)}</b><br><span class="dim">${esc(x.text)}</span></div>`).join("")
+      :`<div class="dim">Nothing yet.</div>`}</div>`;
+}
+function notesSeen(){ let v=0; try{ v=+localStorage.getItem("evw_notif_seen")||0; }catch(e){} return v; }
+function unreadNotes(){ return !!(help.notif&&help.notif.latest>notesSeen()); }
+function markNotesSeen(){
+  if(!help.notif) return;
+  try{ localStorage.setItem("evw_notif_seen",String(help.notif.latest)); }catch(e){}
+  setHelpDot();
+}
+function setHelpDot(){
+  $("#updDot").style.display=(help.updNewer||unreadNotes())?"inline":"none";
+}
+async function loadNotify(){
+  if(!help.notif) helpMain();
+  try{ help.notif=await api("/api/notify"); }catch(e){ helpMain(`<span class="bad">${esc(e.message)}</span>`); return; }
+  if(help.open&&help.sec==="notify"){ markNotesSeen(); helpMain(); }
+}
+async function notifySet(patch){
+  try{
+    help.notif=await api("/api/notify/config",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(patch)});
+    helpMain();
+  }catch(e){ helpMain(`<span class="bad">${esc(e.message)}</span>`); }
+}
+async function notifyCheckNow(){
+  try{ await api("/api/notify/check",{method:"POST"}); }catch(e){ toast(e.message); return; }
+  helpMain(`<span class="dim">Checking now — results appear here in a minute.</span>`);
+  setTimeout(()=>{ if(help.open&&help.sec==="notify") loadNotify(); },15000);
+}
+async function notifyTest(){
+  try{ help.notif=await api("/api/notify/test",{method:"POST"}); }catch(e){ toast(e.message); return; }
+  markNotesSeen(); helpMain(); pollNotify();
+}
+async function notifyClear(){
+  try{ help.notif=await api("/api/notify/clear",{method:"POST"}); }catch(e){ toast(e.message); return; }
+  markNotesSeen(); helpMain();
+}
+let notesToasted=null;     // newest notice already shown in this tab
+async function pollNotify(){
+  let r; try{ r=await api("/api/notify"); }catch(e){ return; }
+  help.notif=r;
+  if(notesToasted===null) notesToasted=r.latest;   // don't replay old ones on page load
+  const fresh=r.feed.filter(x=>x.id>notesToasted);
+  if(fresh.length){
+    notesToasted=r.latest;
+    toast(fresh.length===1?fresh[0].title+" — "+fresh[0].text
+      :fresh.length+" new notices — latest: "+fresh[0].title);
+  }
+  if(help.open&&help.sec==="notify"){
+    markNotesSeen();
+    const a=document.activeElement;      // don't re-render under the user's typing
+    if(!(a&&(a.type==="number"||a.tagName==="SELECT")&&$("#helpModal").contains(a))) helpMain();
+  }
+  setHelpDot();
 }
 async function helpUpdate(){
+  help.sec="about";
   helpMain(`<span class="dim">Checking…</span>`);
   try{
     const r=await api("/api/update?force=1");
@@ -3176,8 +3802,8 @@ function showUpdate(r){
 async function quietUpdateCheck(){
   try{
     const r=await api("/api/update");
-    if(r.newer){ $("#updDot").style.display="inline";
-      toast("EveWatch "+r.latest+" is available — see Help → Check for updates."); }
+    if(r.newer){ help.updNewer=true; setHelpDot();
+      toast("EveWatch "+r.latest+" is available — see Help & settings → About & updates."); }
   }catch(e){}
 }
 async function helpQuit(){
@@ -3297,7 +3923,7 @@ function csCard(c){
 }
 /* Hidden tab, opened from Help: connection setup + optional loyalty points */
 function openSettings(){
-  $("#helpPop").style.display="none";
+  closeHelp();
   state.tab="setup"; nav(); render();
 }
 function rSetupTab(m){
@@ -3339,8 +3965,9 @@ async function boot(){
   state.tab="characters"; state.entered=false;
   setTimeout(quietUpdateCheck, 4000);
   heartbeat(); setInterval(heartbeat, 5000);
+  setTimeout(pollNotify, 3000); setInterval(pollNotify, 30000);
   if(location.hash==="#update"){ history.replaceState(null,"","/");
-    toggleHelp(); helpUpdate(); }
+    openHelp("about"); helpUpdate(); }
   nav(); render();
   loadCatalog();
   refreshChars();
@@ -3352,7 +3979,7 @@ async function loadCatalog(){
   try{
     const d = await api("/api/catalog");
     if(d.skills){ state.catalog=d;
-      if(["skills","characters","overview"].includes(state.tab)) softRender(); }
+      if(["skills","characters","overview","accomplishments"].includes(state.tab)) softRender(); }
     else if(d.state!=="error"){ setTimeout(loadCatalog, 2500); }
     else toast("Skill catalog failed: "+d.error);
   }catch(e){ setTimeout(loadCatalog, 4000); }
@@ -3361,7 +3988,7 @@ async function refreshChars(){
   for(const c of state.status.characters){
     api("/api/character/"+c.character_id+"/summary")
       .then(d=>{ state.chars[c.character_id]=d;
-                 if(["characters","overview"].includes(state.tab)) softRender();
+                 if(["characters","overview","accomplishments"].includes(state.tab)) softRender();
                  else if(state.tab==="skills"&&state.skillsSub==="planner") renderSkillPick();
                  else if(state.tab==="skills") softRender(); })
       .catch(e=>toast(c.name+": "+e.message));
@@ -3372,7 +3999,7 @@ function render(){
   const m=$("#main");
   ({characters:rSelect, overview:rChars, skills:rSkills, assets:rAssets,
     wallet:rWallet, lpstore:rLPStore, market:rMarket, itemsearch:rItemSearch, contracts:rContracts,
-    industry:rIndustry, setup:rSetupTab}[state.tab])(m);
+    industry:rIndustry, accomplishments:rAccomplishments, setup:rSetupTab}[state.tab])(m);
   applyCollapsed();
 }
 // click a gold card header to fold/unfold it (remembered per header)
@@ -3425,12 +4052,13 @@ function setupHtml(open){
     on this computer, in the <b>evewatch_data</b> folder next to the app.</p>
   </div>
   <div class="card" ${open?"":'data-defcollapsed="1"'}>
-    <h2>Optional permissions: loyalty points &amp; research points</h2>
-    <p>Each of these read-only permissions unlocks a feature on the LP Store tab:
-    loyalty-point balances, and research-agent points (with datacore values).<br>
-    ${(st.extra_scopes||[]).concat([st.research_scope]).filter(Boolean).map(s=>`<code>${s}</code>`).join(" ")}</p>
+    <h2>Optional permissions: loyalty points, research points &amp; contracts</h2>
+    <p>Each of these read-only permissions unlocks a feature: loyalty-point balances and
+    research-agent points (with datacore values) on the LP Store tab, and the
+    "contract sold" notification (Help &amp; settings → Notifications).<br>
+    ${(st.extra_scopes||[]).concat([st.research_scope,st.contracts_scope]).filter(Boolean).map(s=>`<code>${s}</code>`).join(" ")}</p>
     <p class="muted-note">Order matters: first tick them on your developer
-    application at developers.eveonline.com (under esi-characters), then switch
+    application at developers.eveonline.com (under esi-characters / esi-contracts), then switch
     this on, then add each character again with the + slot above. If you switch
     it on before the portal is updated, EVE's login will reject the request.</p>
     <label style="display:block"><input type="checkbox" id="extrasBox"
@@ -3439,15 +4067,19 @@ function setupHtml(open){
     <label style="display:block;margin-top:6px"><input type="checkbox" id="researchBox"
       ${st.scope_research?"checked":""} onchange="saveExtras()">
       Request the research-points permission when logging in</label>
+    <label style="display:block;margin-top:6px"><input type="checkbox" id="contractsBox"
+      ${st.scope_contracts?"checked":""} onchange="saveExtras()">
+      Request the contracts permission when logging in</label>
   </div>`;
 }
 async function saveExtras(){
-  const on=$("#extrasBox").checked, rs=$("#researchBox").checked;
+  const on=$("#extrasBox").checked, rs=$("#researchBox").checked, ct=$("#contractsBox").checked;
   await api("/api/config",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({scope_extras:on,scope_research:rs})});
-  state.status.scope_extras=on; state.status.scope_research=rs;
-  toast(on||rs?"Saved — enable the permissions in the developer portal first, then re-add your characters."
+    body:JSON.stringify({scope_extras:on,scope_research:rs,scope_contracts:ct})});
+  state.status.scope_extras=on; state.status.scope_research=rs; state.status.scope_contracts=ct;
+  if(help.notif) help.notif.contracts_scope=ct;
+  toast(on||rs||ct?"Saved — enable the permissions in the developer portal first, then re-add your characters."
           :"Off — logins will use the standard permissions only.");
 }
 async function saveCid(){
@@ -3743,7 +4375,7 @@ function renderPlanList(){
   const el=$("#plancard"); if(!el) return;
   el.innerHTML=`
     <div class="row" style="justify-content:space-between">
-      <h2 style="margin:0">Current plan (${state.plan.length})</h2>
+      <h2 style="margin:0">Current plan${state.plan.length&&planTitle()?": "+esc(planTitle()):""} (${state.plan.length})</h2>
       <span class="row">
         <select id="plansel" onchange="loadPlan(this.value)">
           <option value="">— saved plans —</option>
@@ -3753,7 +4385,7 @@ function renderPlanList(){
         <button class="btn sec" onclick="savePlan()">Save plan</button>
         <button class="btn sec" onclick="deletePlan()">Delete</button>
         <button class="btn danger"
-          onclick="state.plan=[];renderPlanList()">Clear</button>
+          onclick="state.plan=[];state.planParts=[];renderPlanList()">Clear</button>
       </span>
     </div>
     <div id="planlist">${state.plan.length?
@@ -3881,16 +4513,28 @@ function toggleGroup(gid){
   state.openGroups[gid]=!state.openGroups[gid];
   renderSkillPick();
 }
+/* The current plan gets a readable name from what was added to it
+   ("Ishtar · Mastery IV", "Armor Tanking · Elite"…), used when saving. */
+function notePlan(label){
+  if(!state.plan.length||!state.planParts) state.planParts=[];
+  if(!state.planParts.includes(label)) state.planParts.push(label);
+}
+function planTitle(){
+  const p=state.planParts||[];
+  return !p.length?"":p.length<=2?p.join(" + "):p[0]+" + "+(p.length-1)+" more";
+}
 function addToPlan(id,lvl){
+  notePlan(skillName(id)+" "+roman(lvl));
   const i=state.plan.findIndex(e=>e[0]===id);
   if(i>=0) state.plan[i][1]=lvl; else state.plan.push([id,lvl]);
   renderPlanList();   // skill browser stays exactly where it was
 }
 async function savePlan(){
-  const name=prompt("Plan name:"); if(!name) return;
+  const name=(prompt("Plan name:",planTitle())||"").trim(); if(!name) return;
   state.plans=await api("/api/plans",{method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({name,entries:state.plan})});
+  state.planParts=[name];
   renderPlanList();
 }
 async function deletePlan(){
@@ -3901,7 +4545,7 @@ async function deletePlan(){
   renderPlanList();
 }
 function loadPlan(name){
-  if(name && state.plans[name]){ state.plan=state.plans[name].map(e=>[...e]);
+  if(name && state.plans[name]){ state.plan=state.plans[name].map(e=>[...e]); state.planParts=[name];
     renderPlanList(); }
 }
 async function computePlan(){
@@ -5474,6 +6118,8 @@ async function fillMasteryTimes(){
 }
 function planMastery(cid,shipId,toTier){     // add everything missing up to tier N
   state.planChar=cid;
+  const ship=((state.mast.info||{})[shipId]||[])[2]||(state._info&&state._info.name)||"Ship";
+  notePlan(`${ship} · Mastery ${roman(toTier)}`);
   for(let t=0;t<toTier;t++){
     Object.entries(masteryNeeds(shipId,t)).forEach(([sid,lv])=>{
       if(charLevel(cid,sid)>=lv) return;
@@ -5670,6 +6316,7 @@ async function fillTrainingNeeds(){
 function addReqToPlan(cid){
   const d=state._info; if(!d) return;
   state.planChar=cid;
+  notePlan((d.category==="Ship"?"Fly ":"Use ")+d.name);
   d.required.filter(([sid,lvl])=>charLevel(cid,sid)<lvl).forEach(([sid,lvl])=>{
     const i=state.plan.findIndex(e=>e[0]===sid);
     if(i>=0) state.plan[i][1]=Math.max(state.plan[i][1],lvl);
@@ -6154,6 +6801,173 @@ async function runTradeScan(){
 }
 
 /* ---------------- Industry ---------------- */
+/* ---------------- Accomplishments ----------------
+   Worked out from the character's skills and CCP's certificate/mastery data
+   (ESI has no achievements endpoint). */
+const CERT_LV=["—","Basic","Standard","Improved","Advanced","Elite"];
+const SHIP_CLASSES=[
+  ["Frigates",["Frigate","Assault Frigate","Interceptor","Covert Ops","Electronic Attack Ship",
+    "Stealth Bomber","Logistics Frigate","Expedition Frigate","Prototype Exploration Ship"]],
+  ["Destroyers",["Destroyer","Interdictor","Command Destroyer","Tactical Destroyer"]],
+  ["Cruisers",["Cruiser","Heavy Assault Cruiser","Force Recon Ship","Combat Recon Ship","Logistics",
+    "Heavy Interdiction Cruiser","Strategic Cruiser","Flag Cruiser"]],
+  ["Battlecruisers",["Combat Battlecruiser","Attack Battlecruiser","Command Ship"]],
+  ["Battleships",["Battleship","Marauder","Black Ops"]],
+  ["Industrial & mining",["Hauler","Blockade Runner","Deep Space Transport","Freighter","Jump Freighter",
+    "Mining Barge","Exhumer","Industrial Command Ship","Capital Industrial Ship","Expedition Command Ship"]],
+  ["Capitals",["Dreadnought","Lancer Dreadnought","Carrier","Supercarrier","Titan","Force Auxiliary","Command Carrier"]]];
+function shipClass(g){ const c=SHIP_CLASSES.find(([,gs])=>gs.includes(g)); return c?c[0]:"Other"; }
+function acPips(l){ return `<span class="ac-pips">${[1,2,3,4,5].map(i=>
+  `<i style="${i<=l?`background:var(--l${l});outline-color:var(--l${l})`:""}"></i>`).join("")}</span>`; }
+function acMinutes(cid,miss){             // training time for [[sid,lvl]] (prerequisites not included)
+  const d=state.chars[cid], sk=state.catalog&&state.catalog.skills;
+  if(!d||!sk) return null;
+  const at=ovAttrs(d); let t=0;
+  for(const [sid,lv] of miss){
+    const s=sk[sid]; if(!s) continue;
+    const rate=(at[s.primary]?.total||20)+(at[s.secondary]?.total||20)/2;
+    const cur=Math.max(d.skills?.[sid]?.sp||0, spAt(s.rank,charLevel(cid,sid)));
+    t+=Math.max(0,spAt(s.rank,lv)-cur)/rate;
+  }
+  return t;
+}
+function certLevel(cid,c){
+  let l=0;
+  for(let i=0;i<5;i++){
+    if(Object.entries(c.s).some(([sid,lv])=>charLevel(cid,sid)<(lv[i]||0))) break;
+    l=i+1;
+  }
+  return l;
+}
+function acCompute(cid){
+  const d=state.chars[cid], m=state.mast;
+  const key=cid+"|"+(d.total_sp||0)+"|"+(m.build||"")+"|"+(state.catalog?1:0);
+  if(state._ac&&state._ac.key===key) return state._ac;
+  const certs=Object.entries(m.certs).map(([id,c])=>{
+    const lv=certLevel(cid,c);
+    let miss=null, min=null;
+    if(lv<5){
+      miss=Object.entries(c.s).filter(([sid,l])=>charLevel(cid,sid)<(l[lv]||0)).map(([sid,l])=>[+sid,l[lv]]);
+      min=acMinutes(cid,miss);
+    }
+    return {id,n:c.n,g:c.g||"Other",lv,miss,min};
+  }).sort((a,b)=>a.n.localeCompare(b.n));
+  const info=m.info||{}, classes={}, ships=[];
+  for(const sid of Object.keys(m.ships)){
+    const r=masteryCalc(cid,sid); if(!r) continue;
+    const inf=info[sid]||["",1,""], cls=shipClass(inf[0]);
+    const row=classes[cls]||(classes[cls]={tot:0,c:[0,0,0,0,0]});
+    row.tot++; if(r.level) row.c[r.level-1]++;
+    ships.push({id:sid,name:inf[2]||skillName(sid),cls,tech:inf[1],lv:r.level,tiers:r.tiers});
+  }
+  const skills=Object.values(d.skills||{});
+  const out={key,certs,classes,ships,
+    atV:skills.filter(s=>s.level>=5).length, trained:skills.filter(s=>s.level>0).length,
+    elite:certs.filter(c=>c.lv===5).length, m5:ships.filter(s=>s.lv>=5).length};
+  // closest unlocks: next certificate level / next mastery on things already started
+  const cand=certs.filter(c=>c.lv>=1&&c.lv<5&&c.min).map(c=>({kind:CERT_LV[c.lv+1]+" certificate",
+      name:c.n,miss:c.miss,min:c.min}))
+    .concat(ships.filter(s=>s.lv>=1&&s.lv<s.tiers).map(s=>{
+      const miss=masteryMissingUpTo(cid,s.id,s.lv+1).map(([sid,lv])=>[sid,lv]);
+      return {kind:"Mastery "+roman(s.lv+1),name:s.name,miss,min:acMinutes(cid,miss)};
+    }).filter(x=>x.min));
+  out.next=cand.sort((a,b)=>a.min-b.min).slice(0,6);
+  state._ac=out; return out;
+}
+const AC_MEDALS=[        // family, colour, thresholds, label
+  ["sp","#58a6ff",[5e6,10e6,25e6,50e6,100e6,150e6,200e6],n=>(n/1e6)+"M",n=>(n/1e6)+" million SP"],
+  ["v","#4cc38a",[10,25,50,100,150,200],n=>n,n=>n+" skills at level V"],
+  ["e","#e0b455",[1,5,10,25,50],n=>n,n=>n===1?"First Elite certificate":n+" Elite certificates"],
+  ["m","#a274f0",[1,10,25,50,100],n=>n,n=>n===1?"First ship at Mastery V":n+" ships at Mastery V"]];
+function acMedals(cid,a){
+  const val={sp:state.chars[cid].total_sp||0,v:a.atV,e:a.elite,m:a.m5};
+  const out=[];
+  AC_MEDALS.forEach(([k,col,ths,short,long])=>{
+    const got=ths.filter(t=>val[k]>=t), nxt=ths.find(t=>val[k]<t);
+    got.forEach(t=>out.push({col,s:short(t),t:long(t),on:true}));
+    if(nxt!=null) out.push({col,s:short(nxt),t:long(nxt),on:false});
+  });
+  const any=(f)=>a.ships.some(f);
+  [["BS","Battleship pilot","Mastery I in a battleship",s=>s.cls==="Battleships"&&s.lv>=1],
+   ["T2","Tech II specialist","Mastery V in a Tech II ship",s=>s.tech===2&&s.lv>=5],
+   ["T3","Tech III pilot","Mastery I in a Tech III ship",s=>s.tech===3&&s.lv>=1],
+   ["CAP","Capital pilot","Mastery I in a capital ship",s=>s.cls==="Capitals"&&s.lv>=1]]
+    .forEach(([sh,t,d,f])=>out.push({col:"#e5534b",s:sh,t,d,on:any(f)}));
+  return out;
+}
+function acPlan(cid,i,fromCert){
+  const a=state._ac; if(!a) return;
+  const item=fromCert?a.certs.find(c=>c.id===i):a.next[i]; if(!item||!item.miss) return;
+  const label=fromCert?`${item.n} · ${CERT_LV[item.lv+1]}`
+    :`${item.name} · ${item.kind.replace(" certificate","")}`;
+  state.planChar=cid;
+  notePlan(label);
+  item.miss.forEach(([sid,lv])=>{
+    const j=state.plan.findIndex(e=>e[0]===+sid);
+    if(j>=0) state.plan[j][1]=Math.max(state.plan[j][1],lv); else state.plan.push([+sid,lv]);
+  });
+  toast("Added to your skill plan: "+label+" — see Skills → Planner for prerequisites and the total time.");
+}
+function acSetFilter(f){ state.acFilter=f; render(); }
+function rAccomplishments(m){
+  const cid=state.activeChar, d=state.chars[cid];
+  const c=(state.status.characters||[]).find(x=>String(x.character_id)===String(cid));
+  if(!c){ m.innerHTML=`<div class="card"><p class="dim">Select a character first.</p></div>`; return; }
+  if(!d||!state.mast){
+    if(!state.mast) ensureMasteries().then(()=>{ if(state.tab==="accomplishments") render(); });
+    m.innerHTML=`<div class="card"><p class="dim">Loading ${esc(c.name)}'s skills and CCP's certificate data…</p></div>`;
+    return;
+  }
+  const a=acCompute(cid), tm=x=>x==null?"":dur(x);
+  const anyM=Object.values(a.classes).reduce((s,r)=>s+r.c.reduce((x,y)=>x+y,0),0);
+  const lvLine=[5,4,3].map(l=>`${a.certs.filter(x=>x.lv===l).length} ${CERT_LV[l]}`).join(" · ");
+  const tiles=`<div class="ac-tiles">
+    <div class="ac-tile"><div class="k">Skill points</div><div class="v">${((d.total_sp||0)/1e6).toFixed(1)}M</div>
+      <div class="s">${num(d.total_sp)} SP${d.unallocated_sp?` · ${num(d.unallocated_sp)} unallocated`:""}</div></div>
+    <div class="ac-tile"><div class="k">Skills at V</div><div class="v">${a.atV}</div><div class="s">of ${a.trained} trained skills</div></div>
+    <div class="ac-tile"><div class="k">Elite certificates</div><div class="v lv5">${a.elite}</div><div class="s">${lvLine.replace(/^\d+ Elite · /,"")}</div></div>
+    <div class="ac-tile"><div class="k">Mastery V ships</div><div class="v lv5">${a.m5}</div><div class="s">${anyM} ships with any mastery</div></div></div>`;
+  const medals=acMedals(cid,a);
+  const medalCard=`<div class="card"><h2>Milestones</h2>
+    <p class="ac-sub">${medals.filter(x=>x.on).length} earned · the faded one in each row is the next to go for</p>
+    <div class="ac-medals">${medals.map(x=>`<div class="ac-medal ${x.on?"":"locked"}" title="${esc(x.d||x.t)}">
+      <div class="disc" style="background:${x.col}">${esc(String(x.s))}</div><div class="t">${esc(x.t)}</div>
+      <div class="d">${x.on?"Earned":"Not yet"}</div></div>`).join("")}</div></div>`;
+  const nextCard=`<div class="card ac-next"><h2>Next up</h2>
+    <p class="ac-sub">The closest next levels for certificates and ship masteries you've started</p>
+    ${a.next.length?a.next.map((x,i)=>`<div class="row"><div class="grow"><span class="dim small">${esc(x.kind)}</span><br>
+      <b>${esc(x.name)}</b><div class="dim small" title="${esc(x.miss.map(([s,l])=>skillName(s)+" "+roman(l)).join(", "))}">needs ${
+        x.miss.length===1?esc(skillName(x.miss[0][0]))+" "+roman(x.miss[0][1]):x.miss.length+" skills"}</div></div>
+      <div style="text-align:right"><div class="small">${tm(x.min)}</div>
+      <button class="btn sec" style="margin-top:4px;padding:3px 10px" onclick="acPlan('${cid}',${i})">+ Plan</button></div></div>`).join("")
+      :`<p class="dim">Nothing in progress yet.</p>`}</div>`;
+  const f=state.acFilter||"all";
+  const show=x=>f==="all"||(f==="elite"&&x.lv===5)||(f==="prog"&&x.lv>0&&x.lv<5)||(f==="none"&&x.lv===0);
+  const groups=[...new Set(a.certs.map(x=>x.g))].sort();
+  const certCard=`<div class="card"><h2>Certificates</h2>
+    <p class="ac-sub">${a.certs.filter(x=>x.lv).length} of ${a.certs.length} held · ${lvLine} · worked out from your skills</p>
+    <div class="ac-filters">${[["all","All"],["elite","Elite"],["prog","In progress"],["none","Not started"]].map(([k,l])=>
+      `<button class="ac-chip ${f===k?"on":""}" onclick="acSetFilter('${k}')">${l}</button>`).join("")}</div>
+    ${groups.map(g=>{ const list=a.certs.filter(x=>x.g===g&&show(x)); if(!list.length) return "";
+      return `<div class="ac-group"><h3>${esc(g)}</h3><div class="ac-cgrid">${list.map(x=>`
+      <div class="ac-cert l${x.lv}"><div class="top"><span>${esc(x.n)}</span><span class="lv${x.lv}" style="font-weight:600;font-size:12.5px">${CERT_LV[x.lv]}</span></div>
+        ${acPips(x.lv)}
+        <span class="dim small">${x.miss?`<span title="${esc(x.miss.map(([s,l])=>skillName(s)+" "+roman(l)).join(", "))}">Next: ${
+          x.miss.length===1?esc(skillName(x.miss[0][0]))+" "+roman(x.miss[0][1]):x.miss.length+" skills"}${x.min!=null?" · "+tm(x.min):""}</span>
+          · <button class="ac-link" onclick="acPlan('${cid}','${x.id}',true)">+ Plan</button>`:"All five levels ✓"}</span></div>`).join("")}</div></div>`;}).join("")
+      ||`<p class="dim">No certificates match this filter.</p>`}
+    <div class="ac-legend">${[1,2,3,4,5].map(l=>`<span style="--c:var(--l${l})">${roman(l)} · ${CERT_LV[l]}</span>`).join("")}</div></div>`;
+  const rows=SHIP_CLASSES.map(([k])=>k).concat(["Other"]).filter(k=>a.classes[k]);
+  const mastCard=`<div class="card"><h2>Ship masteries</h2>
+    <p class="ac-sub">${a.ships.length} ships with mastery data${state.mast.info?"":" — refresh ship mastery data (Help &amp; settings → General) to group them by class"}</p>
+    <table><tr><th>Ship class</th><th>Spread</th>${[1,2,3,4,5].map(l=>`<th class="num">${roman(l)}</th>`).join("")}<th class="num">None</th></tr>${
+    rows.map(k=>{ const r=a.classes[k], none=r.tot-r.c.reduce((x,y)=>x+y,0);
+      return `<tr><td>${k}</td><td><div class="ac-stack">${r.c.map((n,i)=>`<i style="width:${n/r.tot*100}%;background:var(--l${i+1})"></i>`).join("")}</div></td>${
+        r.c.map((n,i)=>`<td class="num ${n?"lv"+(i+1):"dim"}">${n||"·"}</td>`).join("")}<td class="num dim">${none}</td></tr>`;}).join("")}</table>
+    <p class="muted-note">Data: CCP static data build ${esc(String(state.mast.build||"?"))}. Look up a ship in Item Search for its mastery details.</p></div>`;
+  m.innerHTML=`${tiles}<div class="ac-top">${medalCard}${nextCard}</div>${certCard}${mastCard}`;
+}
+
 function rIndustry(m){
   m.innerHTML=`<div class="card"><h2>Industry</h2>
     <div class="row">${charSelect("iChar")}
@@ -6334,6 +7148,7 @@ def main():
     print("Your data lives in:", DATA_DIR)
     threading.Thread(target=archiver_loop, daemon=True).start()
     threading.Thread(target=seed_hubs, daemon=True).start()
+    threading.Thread(target=notify_loop, daemon=True).start()
     threading.Thread(target=_tab_watcher, daemon=True).start()
     if "--no-browser" not in args:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()

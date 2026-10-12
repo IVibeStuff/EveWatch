@@ -14,6 +14,18 @@ def stop():
         _icon[0].stop()
 
 
+def notify(title, text):
+    """Pop up a desktop notification from the tray icon. True if shown."""
+    ic = _icon[0]
+    try:
+        if ic and ic.HAS_NOTIFICATION:
+            ic.notify(text, title)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def run(name, icon_path, on_open, on_update, on_quit):
     """Show the tray icon and block until the user picks Quit.
     Returns True if the icon ran, False if the system can't show one."""
